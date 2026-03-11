@@ -161,3 +161,17 @@ feishu_doc:
   verify_content: false
   verify_content_lang: "zh"
   timeout: 30
+
+wecom_bot:
+  enabled: false
+  strict: false
+  bot_id: ""
+  secret: ""
+  single_userid: ""
+  group_chatid: ""
+  auto_targets:
+    - "single"
+  ws_url: "wss://openws.work.weixin.qq.com"
+  open_timeout: 20
+  ack_timeout: 20
+  max_message_length: 3200

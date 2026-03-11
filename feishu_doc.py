@@ -5,6 +5,7 @@ from datetime import date
 import mimetypes
 import re
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,8 +25,10 @@ class FeishuDocSettings:
     app_secret: str
     folder_token: str = ""
     doc_url_prefix: str = "https://www.feishu.cn/docx/"
-    timeout: int = 30
+    timeout: int = 60
     api_base: str = "https://open.feishu.cn"
+    request_retries: int = 3
+    retry_backoff_seconds: float = 2.0
     image_width: int = 960
     narrow_image_width: int = 760
     tall_ratio_threshold: float = 1.9
@@ -47,21 +50,69 @@ def _safe_json(response: requests.Response) -> Dict[str, Any]:
     return payload
 
 
-def _api_request(
+def _rewind_files(files: Any) -> None:
+    if not isinstance(files, dict):
+        return
+    for value in files.values():
+        if not isinstance(value, tuple) or len(value) < 2:
+            continue
+        handle = value[1]
+        if hasattr(handle, "seek"):
+            try:
+                handle.seek(0)
+            except Exception:
+                continue
+
+
+def _request_with_retry(
+    *,
     method: str,
     url: str,
     timeout: int,
+    request_retries: int,
+    retry_backoff_seconds: float,
+    **kwargs: Any,
+) -> requests.Response:
+    last_exc: Optional[requests.RequestException] = None
+    attempts = max(1, int(request_retries))
+    backoff = max(0.0, float(retry_backoff_seconds))
+    for attempt in range(1, attempts + 1):
+        _rewind_files(kwargs.get("files"))
+        try:
+            return requests.request(
+                method=method.upper(),
+                url=url,
+                timeout=timeout,
+                **kwargs,
+            )
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                break
+            if backoff > 0:
+                time.sleep(backoff * attempt)
+    raise FeishuDocError(
+        f"HTTP request failed after {attempts} attempts: {last_exc}"
+    )
+
+
+def _api_request(
+    settings: FeishuDocSettings,
+    method: str,
+    url: str,
     headers: Optional[Dict[str, str]] = None,
     params: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    response = requests.request(
-        method=method.upper(),
+    response = _request_with_retry(
+        method=method,
         url=url,
+        timeout=settings.timeout,
+        request_retries=settings.request_retries,
+        retry_backoff_seconds=settings.retry_backoff_seconds,
         headers=headers,
         params=params,
         json=json_body,
-        timeout=timeout,
     )
     payload = _safe_json(response)
     code = payload.get("code")
@@ -75,10 +126,13 @@ def _api_request(
 
 
 def _fetch_tenant_access_token(settings: FeishuDocSettings) -> str:
-    response = requests.post(
-        f"{settings.api_base.rstrip('/')}/open-apis/auth/v3/tenant_access_token/internal",
-        json={"app_id": settings.app_id, "app_secret": settings.app_secret},
+    response = _request_with_retry(
+        method="POST",
+        url=f"{settings.api_base.rstrip('/')}/open-apis/auth/v3/tenant_access_token/internal",
         timeout=settings.timeout,
+        request_retries=settings.request_retries,
+        retry_backoff_seconds=settings.retry_backoff_seconds,
+        json={"app_id": settings.app_id, "app_secret": settings.app_secret},
     )
     payload = _safe_json(response)
     code = payload.get("code")
@@ -97,9 +151,9 @@ def _create_document(settings: FeishuDocSettings, token: str, title: str) -> str
     if folder_token:
         body["folder_token"] = folder_token
     data = _api_request(
+        settings=settings,
         method="POST",
         url=f"{settings.api_base.rstrip('/')}/open-apis/docx/v1/documents",
-        timeout=settings.timeout,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
         json_body=body,
     )
@@ -120,9 +174,9 @@ def _list_blocks(settings: FeishuDocSettings, token: str, document_id: str) -> L
         if page_token:
             params["page_token"] = page_token
         data = _api_request(
+            settings=settings,
             method="GET",
             url=f"{settings.api_base.rstrip('/')}/open-apis/docx/v1/documents/{document_id}/blocks",
-            timeout=settings.timeout,
             headers={"Authorization": f"Bearer {token}"},
             params=params,
         )
@@ -214,9 +268,9 @@ def _insert_children(
     for offset in range(0, len(children), batch_size):
         batch = children[offset : offset + batch_size]
         _api_request(
+            settings=settings,
             method="POST",
             url=f"{settings.api_base.rstrip('/')}/open-apis/docx/v1/documents/{document_id}/blocks/{root_block_id}/children",
-            timeout=settings.timeout,
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
             params={"document_revision_id": -1},
             json_body={"index": insert_index, "children": batch},
@@ -261,9 +315,9 @@ def _append_text_blocks(
     if not children:
         return 0
     _api_request(
+        settings=settings,
         method="POST",
         url=f"{settings.api_base.rstrip('/')}/open-apis/docx/v1/documents/{document_id}/blocks/{root_block_id}/children",
-        timeout=settings.timeout,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
         params={"document_revision_id": -1},
         json_body={"index": index, "children": children},
@@ -280,9 +334,9 @@ def _create_image_placeholder(
 ) -> str:
     temp_id = f"tmp_img_{uuid.uuid4().hex}"
     data = _api_request(
+        settings=settings,
         method="POST",
         url=f"{settings.api_base.rstrip('/')}/open-apis/docx/v1/documents/{document_id}/blocks/{root_block_id}/descendant",
-        timeout=settings.timeout,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
         params={"document_revision_id": -1},
         json_body={
@@ -314,8 +368,12 @@ def _upload_image_token_for_block(
     if not image_path.exists():
         raise FeishuDocError(f"图片文件不存在：{image_path}")
     with image_path.open("rb") as fh:
-        response = requests.post(
-            f"{settings.api_base.rstrip('/')}/open-apis/drive/v1/medias/upload_all",
+        response = _request_with_retry(
+            method="POST",
+            url=f"{settings.api_base.rstrip('/')}/open-apis/drive/v1/medias/upload_all",
+            timeout=settings.timeout,
+            request_retries=settings.request_retries,
+            retry_backoff_seconds=settings.retry_backoff_seconds,
             headers={"Authorization": f"Bearer {token}"},
             data={
                 "file_name": image_path.name,
@@ -325,7 +383,6 @@ def _upload_image_token_for_block(
                 "extra": f'{{"drive_route_token":"{document_id}"}}',
             },
             files={"file": (image_path.name, fh, _guess_mime(image_path))},
-            timeout=settings.timeout,
         )
     payload = _safe_json(response)
     code = payload.get("code")
@@ -348,9 +405,9 @@ def _replace_image_for_block(
     image_height: int,
 ) -> None:
     _api_request(
+        settings=settings,
         method="PATCH",
         url=f"{settings.api_base.rstrip('/')}/open-apis/docx/v1/documents/{document_id}/blocks/{image_block_id}",
-        timeout=settings.timeout,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
         params={"document_revision_id": -1},
         json_body={"replace_image": {"token": image_token, "width": int(image_width), "height": int(image_height)}},
@@ -683,8 +740,12 @@ def _fetch_doc_markdown_content(
     token: str,
     document_id: str,
 ) -> str:
-    response = requests.get(
-        f"{settings.api_base.rstrip('/')}/open-apis/docs/v1/content",
+    response = _request_with_retry(
+        method="GET",
+        url=f"{settings.api_base.rstrip('/')}/open-apis/docs/v1/content",
+        timeout=settings.timeout,
+        request_retries=settings.request_retries,
+        retry_backoff_seconds=settings.retry_backoff_seconds,
         headers={"Authorization": f"Bearer {token}"},
         params={
             "doc_token": document_id,
@@ -692,7 +753,6 @@ def _fetch_doc_markdown_content(
             "content_type": "markdown",
             "lang": settings.verify_content_lang or "zh",
         },
-        timeout=settings.timeout,
     )
     payload = _safe_json(response)
     code = payload.get("code")
