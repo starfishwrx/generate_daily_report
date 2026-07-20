@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date
 import mimetypes
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from autodatareport.events import current_metrics
 
 _TABLE_FONT_CONFIGURED = False
 
@@ -78,17 +80,32 @@ def _request_with_retry(
     backoff = max(0.0, float(retry_backoff_seconds))
     for attempt in range(1, attempts + 1):
         _rewind_files(kwargs.get("files"))
+        metrics = current_metrics()
+        if metrics is not None:
+            metrics.increment("requests")
         try:
-            return requests.request(
+            response = requests.request(
                 method=method.upper(),
                 url=url,
                 timeout=timeout,
                 **kwargs,
             )
+            status_code = response.status_code
+            retryable_status = isinstance(status_code, int) and (status_code == 429 or 500 <= status_code <= 599)
+            if retryable_status and attempt < attempts:
+                if metrics is not None:
+                    metrics.increment("retries")
+                response.close()
+                if backoff > 0:
+                    time.sleep(backoff * attempt)
+                continue
+            return response
         except requests.RequestException as exc:
             last_exc = exc
             if attempt >= attempts:
                 break
+            if metrics is not None:
+                metrics.increment("retries")
             if backoff > 0:
                 time.sleep(backoff * attempt)
     raise FeishuDocError(
@@ -143,6 +160,12 @@ def _fetch_tenant_access_token(settings: FeishuDocSettings) -> str:
     if not token:
         raise FeishuDocError("飞书鉴权失败：未返回 tenant_access_token")
     return token
+
+
+def fetch_tenant_access_token(settings: FeishuDocSettings) -> str:
+    """Fetch one token that can be shared by all Feishu documents in a run."""
+
+    return _fetch_tenant_access_token(settings)
 
 
 def _create_document(settings: FeishuDocSettings, token: str, title: str) -> str:
@@ -436,6 +459,9 @@ def _trim_image_whitespace(settings: FeishuDocSettings, image_path: Path, temp_r
     if not settings.enable_auto_trim:
         return image_path, _read_image_size(image_path)
     try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
         import matplotlib.image as mpimg
         import matplotlib.pyplot as plt
         import numpy as np
@@ -556,9 +582,11 @@ def _render_markdown_table_image(table_lines: List[str], output_path: Path) -> b
     if not header:
         return False
     try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
         import matplotlib.pyplot as plt
         from matplotlib import font_manager
-        import matplotlib
     except ImportError:
         return False
 
@@ -775,8 +803,10 @@ def publish_report_to_feishu_doc(
     report_base_dir: Optional[Path] = None,
     chart_image_paths: Optional[Dict[str, str]] = None,
     payment_images: Optional[Dict[str, str]] = None,
+    tenant_access_token: str = "",
+    image_upload_concurrency: int = 3,
 ) -> Dict[str, str]:
-    token = _fetch_tenant_access_token(settings)
+    token = tenant_access_token.strip() or _fetch_tenant_access_token(settings)
     title = _build_document_title(report_date=report_date, title_override=title_override, title_prefix=title_prefix)
     document_id = _create_document(settings=settings, token=token, title=title)
     blocks = _list_blocks(settings=settings, token=token, document_id=document_id)
@@ -793,6 +823,7 @@ def publish_report_to_feishu_doc(
         )
         insert_index = 0
         text_buffer: List[str] = []
+        image_jobs: List[Tuple[Path, str, int, int]] = []
         for kind, payload in segments:
             if kind == "text":
                 text_buffer.append(payload)
@@ -828,6 +859,20 @@ def publish_report_to_feishu_doc(
                 root_block_id=root_block_id,
                 index=insert_index,
             )
+            image_jobs.append((prepared_image_path, image_block_id, target_width, target_height))
+            insert_index += 1
+        if text_buffer:
+            _append_text_blocks(
+                settings=settings,
+                token=token,
+                document_id=document_id,
+                root_block_id=root_block_id,
+                index=insert_index,
+                lines=text_buffer,
+            )
+
+        def publish_image(job: Tuple[Path, str, int, int]) -> None:
+            prepared_image_path, image_block_id, target_width, target_height = job
             image_token = _upload_image_token_for_block(
                 settings=settings,
                 token=token,
@@ -844,16 +889,12 @@ def publish_report_to_feishu_doc(
                 image_width=target_width,
                 image_height=target_height,
             )
-            insert_index += 1
-        if text_buffer:
-            _append_text_blocks(
-                settings=settings,
-                token=token,
-                document_id=document_id,
-                root_block_id=root_block_id,
-                index=insert_index,
-                lines=text_buffer,
-            )
+
+        if image_jobs:
+            worker_count = min(max(1, int(image_upload_concurrency)), 3, len(image_jobs))
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="feishu-image") as executor:
+                for future in [executor.submit(publish_image, job) for job in image_jobs]:
+                    future.result()
     out = {
         "document_id": document_id,
         "title": title,

@@ -12,8 +12,9 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from autodatareport.events import current_metrics
 
-from async_utils import gather_limited
+from async_utils import RetryingAsyncClient, gather_limited
 from network_hosts import load_hosts_map, rewrite_url_with_hosts_map
 from tz_compat import get_tzinfo
 
@@ -308,6 +309,20 @@ class ExtraMetricsService:
             self.manage_base = "http://<MANAGE_HOST>"
         self.debug_log = DebugLogStore(settings.query_debug_log_path)
 
+    async def _record_request(self, _request: httpx.Request) -> None:
+        metrics = current_metrics()
+        if metrics is not None:
+            metrics.increment("requests")
+
+    def _client(self) -> httpx.AsyncClient:
+        return RetryingAsyncClient(
+            timeout=self.settings.request_timeout,
+            follow_redirects=True,
+            proxy=self.settings.query_proxy_url or None,
+            trust_env=False,
+            event_hooks={"request": [self._record_request]},
+        )
+
     async def fetch(
         self,
         query_date: date,
@@ -316,31 +331,39 @@ class ExtraMetricsService:
     ) -> dict[str, Any]:
         out: dict[str, Any] = {"notes": {}, "top_games": [], "warnings": [], "payment_tables": {}}
 
-        if fenxi_auth:
+        async def fetch_fenxi() -> tuple[dict[str, Any], str]:
+            if not fenxi_auth:
+                return {}, "fenxi未登录，已跳过新增/活跃/会员指标"
             try:
                 fenxi_data = await self._fetch_fenxi_metrics(query_date, fenxi_auth)
-                out["notes"].update(fenxi_data.get("notes", {}))
-                out["top_games"] = fenxi_data.get("top_games", [])
+                return fenxi_data, ""
             except Exception as exc:  # noqa: BLE001
                 msg = f"fenxi指标拉取失败: {exc}"
-                out["warnings"].append(msg)
                 self.debug_log.write({"event": "extra_fenxi_error", "error": str(exc), "query_date": query_date.isoformat()})
-        else:
-            out["warnings"].append("fenxi未登录，已跳过新增/活跃/会员指标")
+                return {}, msg
 
-        if manage_auth:
+        async def fetch_manage() -> tuple[dict[str, Any], str]:
+            if not manage_auth:
+                return {}, "505未登录，已跳过充值明细"
             try:
                 manage_data = await self._fetch_manage_metrics(query_date, manage_auth)
-                out["notes"].update(manage_data.get("notes", {}))
-                payment_tables = manage_data.get("payment_tables")
-                if isinstance(payment_tables, dict):
-                    out["payment_tables"] = payment_tables
+                return manage_data, ""
             except Exception as exc:  # noqa: BLE001
                 msg = f"manage充值指标拉取失败: {exc}"
-                out["warnings"].append(msg)
                 self.debug_log.write({"event": "extra_manage_error", "error": str(exc), "query_date": query_date.isoformat()})
-        else:
-            out["warnings"].append("505未登录，已跳过充值明细")
+                return {}, msg
+
+        (fenxi_data, fenxi_warning), (manage_data, manage_warning) = await gather_limited(
+            [fetch_fenxi(), fetch_manage()],
+            min(2, self.settings.max_concurrency),
+        )
+        out["notes"].update(fenxi_data.get("notes", {}))
+        out["notes"].update(manage_data.get("notes", {}))
+        out["top_games"] = fenxi_data.get("top_games", [])
+        payment_tables = manage_data.get("payment_tables")
+        if isinstance(payment_tables, dict):
+            out["payment_tables"] = payment_tables
+        out["warnings"].extend(value for value in (fenxi_warning, manage_warning) if value)
 
         return out
 
@@ -350,45 +373,37 @@ class ExtraMetricsService:
         fenxi_auth: dict[str, Any] | None,
         manage_auth: dict[str, Any] | None,
     ) -> dict[str, dict[str, Any]]:
-        result: dict[str, dict[str, Any]] = {
-            "fenxi": {"ok": False, "message": "未检查"},
-            "505": {"ok": False, "message": "未检查"},
-        }
-        if fenxi_auth:
+        async def check_fenxi() -> dict[str, Any]:
+            if not fenxi_auth:
+                return {"ok": False, "message": "fenxi认证信息缺失"}
             try:
                 auth_headers = self._auth_headers(fenxi_auth)
-                async with httpx.AsyncClient(
-                    timeout=self.settings.request_timeout,
-                    follow_redirects=True,
-                    proxy=self.settings.query_proxy_url or None,
-                    trust_env=False,
-                ) as client:
+                async with self._client() as client:
                     self._apply_auth(client, fenxi_auth)
                     await self._fenxi_module_switch(client, auth_headers)
-                result["fenxi"] = {"ok": True, "message": "fenxi登录态可用"}
+                return {"ok": True, "message": "fenxi登录态可用"}
             except Exception as exc:  # noqa: BLE001
-                result["fenxi"] = {"ok": False, "message": f"fenxi登录态不可用: {exc}"}
-        else:
-            result["fenxi"] = {"ok": False, "message": "fenxi认证信息缺失"}
+                return {"ok": False, "message": f"fenxi登录态不可用: {exc}"}
 
-        if manage_auth:
+        async def check_manage() -> dict[str, Any]:
+            if not manage_auth:
+                return {"ok": False, "message": "505认证信息缺失"}
             try:
                 auth_headers = self._auth_headers(manage_auth)
                 hosts_map = load_hosts_map(self.settings.hosts_yaml_path)
-                async with httpx.AsyncClient(
-                    timeout=self.settings.request_timeout,
-                    follow_redirects=True,
-                    proxy=self.settings.query_proxy_url or None,
-                    trust_env=False,
-                ) as client:
+                async with self._client() as client:
                     self._apply_auth(client, manage_auth)
                     await self._bootstrap_callback(client, manage_auth, hosts_map)
                     await self._manage_recharge_detail(client, hosts_map, "gz_web", query_date, auth_headers)
-                result["505"] = {"ok": True, "message": "505登录态可用"}
+                return {"ok": True, "message": "505登录态可用"}
             except Exception as exc:  # noqa: BLE001
-                result["505"] = {"ok": False, "message": f"505登录态不可用: {exc}"}
-        else:
-            result["505"] = {"ok": False, "message": "505认证信息缺失"}
+                return {"ok": False, "message": f"505登录态不可用: {exc}"}
+
+        fenxi_result, manage_result = await gather_limited(
+            [check_fenxi(), check_manage()],
+            min(2, self.settings.max_concurrency),
+        )
+        result = {"fenxi": fenxi_result, "505": manage_result}
 
         self.debug_log.write({"event": "extra_auth_preflight", "query_date": query_date.isoformat(), "result": result})
         return result
@@ -398,12 +413,7 @@ class ExtraMetricsService:
         top_games: list[dict[str, Any]] = []
         auth_headers = self._auth_headers(auth)
 
-        async with httpx.AsyncClient(
-            timeout=self.settings.request_timeout,
-            follow_redirects=True,
-            proxy=self.settings.query_proxy_url or None,
-            trust_env=False,
-        ) as client:
+        async with self._client() as client:
             self._apply_auth(client, auth)
             await self._fenxi_module_switch(client, auth_headers)
 
@@ -469,12 +479,7 @@ class ExtraMetricsService:
         hosts_map = load_hosts_map(self.settings.hosts_yaml_path)
         auth_headers = self._auth_headers(auth)
 
-        async with httpx.AsyncClient(
-            timeout=self.settings.request_timeout,
-            follow_redirects=True,
-            proxy=self.settings.query_proxy_url or None,
-            trust_env=False,
-        ) as client:
+        async with self._client() as client:
             self._apply_auth(client, auth)
             await self._bootstrap_callback(client, auth, hosts_map)
 

@@ -39,6 +39,22 @@ class FeishuDocRetryTests(unittest.TestCase):
                     )
         self.assertEqual(mocked_request.call_count, 2)
 
+    def test_request_with_retry_recovers_from_temporary_503(self) -> None:
+        unavailable = mock.Mock(status_code=503)
+        success = mock.Mock(status_code=200)
+        with mock.patch("feishu_doc.requests.request", side_effect=[unavailable, success]) as mocked_request:
+            with mock.patch("feishu_doc.time.sleep"):
+                result = _request_with_retry(
+                    method="POST",
+                    url="https://open.feishu.cn/open-apis/test",
+                    timeout=60,
+                    request_retries=2,
+                    retry_backoff_seconds=0.1,
+                )
+        self.assertIs(result, success)
+        self.assertEqual(mocked_request.call_count, 2)
+        unavailable.close.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

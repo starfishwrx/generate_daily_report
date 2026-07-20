@@ -17,6 +17,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time as monotonic_time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,6 +27,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import requests
 import yaml
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from app_paths import ensure_first_run_config, migrate_legacy_runtime_files, resolve_app_paths
 from dateutil import parser as date_parser
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
@@ -33,13 +36,25 @@ from auth_repair import AgentRepairCoordinator, AuthRepairSettings, classify_aut
 from extra_auth import build_extra_auth_file, inspect_fenxi_token, load_extra_auth, load_extra_auth_meta
 from extra_metrics_render import render_extra_metrics_block, render_payment_table_images
 from extra_metrics_service import ExtraMetricsService, ExtraSettings
-from feishu_doc import FeishuDocError, FeishuDocSettings, publish_report_to_feishu_doc
+from feishu_doc import FeishuDocError, FeishuDocSettings, fetch_tenant_access_token, publish_report_to_feishu_doc
 from network_hosts import load_hosts_map, rewrite_url_with_hosts_map
 from pc_web_metrics_service import PCWebMetricsService, PCWebSettings
 from publish_state import PublishStateStore, content_hash
 from run_lock import AlreadyRunningError, single_instance_lock
 from tz_compat import get_tzinfo
 from wecom_longbot import WeComBotError, WeComBotSettings, publish_reports_to_wecom
+from async_utils import request_budget
+from autodatareport import __version__
+from autodatareport.cache import ArtifactCache, hash_payload
+from autodatareport.events import (
+    RunMetricsRecorder,
+    configure_runtime_telemetry,
+    current_metrics,
+    emit_event,
+    reset_runtime_telemetry,
+)
+from autodatareport.models import AppConfig, ExtraStageResult, PCStageResult, RunContext, RunOptions
+from autodatareport.pipeline import SourceTask, run_source_tasks
 
 
 _FONT_CONFIGURED = False
@@ -222,6 +237,7 @@ class TargetResult:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate daily cloud gaming report.")
+    parser.add_argument("--version", action="version", version=f"AutoDataReport {__version__}")
     parser.add_argument(
         "--data-dir",
         type=Path,
@@ -426,6 +442,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Maximum concurrent data requests (default: 4).",
     )
     parser.add_argument(
+        "--max-total-concurrency",
+        type=int,
+        default=8,
+        help="Maximum concurrent requests across independent data sources (default: 8).",
+    )
+    parser.add_argument(
+        "--event-stream",
+        choices=["text", "jsonl"],
+        default="text",
+        help="Optional structured runtime event stream used by the desktop GUI.",
+    )
+    parser.add_argument(
         "--push-report-file",
         type=Path,
         default=None,
@@ -494,6 +522,17 @@ def setup_logging(verbose: bool) -> None:
 def emit_progress(percent: int, message: str) -> None:
     pct = max(0, min(100, int(percent)))
     logging.info("[PROGRESS] %d|%s", pct, message)
+    emit_event("progress", "pipeline", message, progress=pct)
+
+
+def finish_stage_timing(stage: str, started: float, **details: Any) -> float:
+    elapsed = monotonic_time.perf_counter() - started
+    logging.info("[TIMING] stage=%s seconds=%.3f", stage, elapsed)
+    metrics = current_metrics()
+    if metrics is not None:
+        metrics.record_stage(stage, elapsed, status="ok", **details)
+    emit_event("stage_finished", stage, duration_seconds=elapsed, details={"status": "ok", **details})
+    return elapsed
 
 
 def load_config(path: Path) -> Dict[str, Any]:
@@ -533,6 +572,19 @@ def configure_870_session(
     args: argparse.Namespace,
     config: Dict[str, Any],
 ) -> None:
+    retry_policy = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=None,
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry_policy, pool_connections=4, pool_maxsize=4)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
     network_cfg = config.get("network") or {}
     if not isinstance(network_cfg, dict):
         raise ReportError("Config field network must be a mapping when provided.")
@@ -827,92 +879,150 @@ def preflight_870_auth(
     return {"ok": True, "message": f"870登录态可用: {label}"}
 
 
+async def _run_remote_preflights(
+    *,
+    config: Dict[str, Any],
+    args: argparse.Namespace,
+    report_date_for_check: date,
+    extra_service: ExtraMetricsService | None,
+    pc_service: PCWebMetricsService | None,
+    extra_auth: Dict[str, Any],
+    pc_web_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    tasks: List[SourceTask] = []
+    if not bool(getattr(args, "skip_870_auth_preflight", False)):
+        tasks.append(
+            SourceTask(
+                "870",
+                lambda: asyncio.to_thread(preflight_870_auth, config, args, report_date_for_check),
+            )
+        )
+    if extra_service is not None:
+        tasks.append(
+            SourceTask(
+                "extra",
+                lambda: extra_service.preflight(
+                    query_date=report_date_for_check,
+                    fenxi_auth=extra_auth.get("fenxi"),
+                    manage_auth=extra_auth.get("505"),
+                ),
+            )
+        )
+    if pc_service is not None:
+        pc_auth_key = str(pc_web_cfg.get("auth_key", "pc_web")).strip() or "pc_web"
+        pc_auth = extra_auth.get(pc_auth_key) or extra_auth.get("pc_web")
+        tasks.append(SourceTask("pc_web", lambda: pc_service.preflight(report_date_for_check, pc_auth)))
+        if bool(pc_web_cfg.get("include_member_metrics", True)):
+            tasks.append(
+                SourceTask(
+                    "pc_member",
+                    lambda: pc_service.preflight_member(report_date_for_check, extra_auth.get("fenxi")),
+                )
+            )
+    batch = await run_source_tasks(tasks, max_active_sources=min(len(tasks) or 1, 4))
+    if batch.errors:
+        name, error = next(iter(batch.errors.items()))
+        raise ReportError(f"{name}登录态预检异常: {error}") from error
+    return batch.values
+
+
 def run_full_auth_preflight(
     config: Dict[str, Any],
     args: argparse.Namespace,
     extra_metrics_cfg: Dict[str, Any],
     extra_auth_file: Path,
-) -> None:
+) -> Dict[str, Any]:
     report_date_for_check = resolve_report_date(args.date)
+    pc_web_cfg = config.get("pc_web_metrics") or {}
+    if not isinstance(pc_web_cfg, dict):
+        raise ReportError("Config field pc_web_metrics must be a mapping when provided.")
+    needs_extension_preflight = bool(args.with_extra_metrics or extra_metrics_cfg.get("enabled") or pc_web_cfg.get("enabled"))
 
-    if not bool(getattr(args, "skip_870_auth_preflight", False)):
-        auth_870 = preflight_870_auth(config, args, report_date_for_check)
+    extra_auth: Dict[str, Any] = {}
+    fenxi_diag: Dict[str, Any] = {"usable": True, "message": "未启用扩展数据"}
+    extra_service: ExtraMetricsService | None = None
+    pc_service: PCWebMetricsService | None = None
+    if needs_extension_preflight:
+        if not extra_auth_file.exists():
+            raise ReportError(f"扩展登录态预检失败: 认证文件不存在：{extra_auth_file}")
+        extra_auth = load_extra_auth(extra_auth_file)
+        extra_auth_meta = load_extra_auth_meta(extra_auth_file)
+        timezone_name = str(extra_metrics_cfg.get("timezone", "Asia/Shanghai"))
+        fenxi_diag = diagnose_fenxi_token(extra_auth, timezone_name=timezone_name, warn_threshold_hours=6.0)
+        logging.info("fenxi_token: %s", fenxi_diag.get("message", ""))
+        auth_age_hours = get_extra_auth_age_hours(extra_auth_file, extra_auth_meta)
+        if auth_age_hours is not None and auth_age_hours > float(args.extra_auth_max_age_hours):
+            logging.warning(
+                "扩展认证文件已超过%.1f小时（阈值=%d小时），建议重新手机验证码登录并刷新认证文件。",
+                auth_age_hours,
+                args.extra_auth_max_age_hours,
+            )
+        extra_settings = ExtraSettings(
+            timezone=timezone_name,
+            request_timeout=int(extra_metrics_cfg.get("request_timeout", 30)),
+            query_proxy_url=str((args.query_proxy_url if args.query_proxy_url is not None else extra_metrics_cfg.get("query_proxy_url", ""))).strip(),
+            hosts_yaml_path=str((args.hosts_yaml_path if args.hosts_yaml_path is not None else extra_metrics_cfg.get("hosts_yaml_path", ""))).strip(),
+            query_debug_log_path=(Path(args.output) / "query_debug.jsonl"),
+            fenxi_base=str(extra_metrics_cfg.get("fenxi_base", "https://<FENXI_HOST>")).strip(),
+            manage_base=str(extra_metrics_cfg.get("manage_base", "http://<MANAGE_HOST>")).strip(),
+            max_concurrency=min(args.max_concurrency, 4),
+        )
+        extra_service = ExtraMetricsService(extra_settings)
+        if bool(pc_web_cfg.get("enabled")):
+            pc_service = create_pc_web_service(config, args, extra_metrics_cfg)
+
+    preflights = asyncio.run(
+        _run_remote_preflights(
+            config=config,
+            args=args,
+            report_date_for_check=report_date_for_check,
+            extra_service=extra_service,
+            pc_service=pc_service,
+            extra_auth=extra_auth,
+            pc_web_cfg=pc_web_cfg,
+        )
+    )
+
+    if "870" in preflights:
+        auth_870 = preflights["870"] or {}
         logging.info("870: %s", auth_870.get("message", ""))
         if not is_preflight_ok(auth_870.get("ok")):
             raise ReportError(str(auth_870.get("message") or "870登录态预检失败"))
-
-    pc_web_cfg = config.get("pc_web_metrics") or {}
-    needs_extension_preflight = bool(args.with_extra_metrics or extra_metrics_cfg.get("enabled") or pc_web_cfg.get("enabled"))
     if not needs_extension_preflight:
-        return
+        return {}
 
-    if not extra_auth_file.exists():
-        raise ReportError(f"扩展登录态预检失败: 认证文件不存在：{extra_auth_file}")
-
-    extra_auth = load_extra_auth(extra_auth_file)
-    extra_auth_meta = load_extra_auth_meta(extra_auth_file)
-    timezone_name = str(extra_metrics_cfg.get("timezone", "Asia/Shanghai"))
-    fenxi_diag = diagnose_fenxi_token(extra_auth, timezone_name=timezone_name, warn_threshold_hours=6.0)
-    logging.info("fenxi_token: %s", fenxi_diag.get("message", ""))
-
-    auth_age_hours = get_extra_auth_age_hours(extra_auth_file, extra_auth_meta)
-    if auth_age_hours is not None and auth_age_hours > float(args.extra_auth_max_age_hours):
-        logging.warning(
-            "扩展认证文件已超过%.1f小时（阈值=%d小时），建议重新手机验证码登录并刷新认证文件。",
-            auth_age_hours,
-            args.extra_auth_max_age_hours,
-        )
-
-    extra_settings = ExtraSettings(
-        timezone=str(extra_metrics_cfg.get("timezone", "Asia/Shanghai")),
-        request_timeout=int(extra_metrics_cfg.get("request_timeout", 30)),
-        query_proxy_url=str((args.query_proxy_url if args.query_proxy_url is not None else extra_metrics_cfg.get("query_proxy_url", ""))).strip(),
-        hosts_yaml_path=str((args.hosts_yaml_path if args.hosts_yaml_path is not None else extra_metrics_cfg.get("hosts_yaml_path", ""))).strip(),
-        query_debug_log_path=(DEFAULT_OUTPUT_DIR / "query_debug.jsonl"),
-        fenxi_base=str(extra_metrics_cfg.get("fenxi_base", "https://<FENXI_HOST>")).strip(),
-        manage_base=str(extra_metrics_cfg.get("manage_base", "http://<MANAGE_HOST>")).strip(),
-    )
-    preflight = asyncio.run(
-        ExtraMetricsService(extra_settings).preflight(
-            query_date=report_date_for_check,
-            fenxi_auth=extra_auth.get("fenxi"),
-            manage_auth=extra_auth.get("505"),
-        )
-    )
-    fenxi_ok = is_preflight_ok((preflight.get("fenxi") or {}).get("ok"))
-    manage_ok = is_preflight_ok((preflight.get("505") or {}).get("ok"))
-    if not bool(fenxi_diag.get("usable")):
-        fenxi_ok = False
-    logging.info("fenxi: %s", (preflight.get("fenxi") or {}).get("message", ""))
-    logging.info("505: %s", (preflight.get("505") or {}).get("message", ""))
+    extra_preflight = preflights.get("extra") or {}
+    fenxi_result = extra_preflight.get("fenxi") or {}
+    manage_result = extra_preflight.get("505") or {}
+    fenxi_ok = is_preflight_ok(fenxi_result.get("ok")) and bool(fenxi_diag.get("usable"))
+    manage_ok = is_preflight_ok(manage_result.get("ok"))
+    logging.info("fenxi: %s", fenxi_result.get("message", ""))
+    logging.info("505: %s", manage_result.get("message", ""))
     if not bool(fenxi_diag.get("usable")):
         logging.error("fenxi token 预检失败: %s", fenxi_diag.get("message", ""))
     if not fenxi_ok:
-        raise ReportError(f"分析后台登录态预检失败: {(preflight.get('fenxi') or {}).get('message', fenxi_diag.get('message', ''))}")
+        raise ReportError(f"分析后台登录态预检失败: {fenxi_result.get('message', fenxi_diag.get('message', ''))}")
     if not manage_ok:
-        raise ReportError(f"505后台登录态预检失败: {(preflight.get('505') or {}).get('message', '')}")
+        raise ReportError(f"505后台登录态预检失败: {manage_result.get('message', '')}")
 
-    if bool(pc_web_cfg.get("enabled")):
+    if pc_service is not None:
         strict_mode = bool(pc_web_cfg.get("strict", True))
-        pc_auth_key = str(pc_web_cfg.get("auth_key", "pc_web")).strip() or "pc_web"
-        pc_auth = extra_auth.get(pc_auth_key) or extra_auth.get("pc_web")
-        pc_service = create_pc_web_service(config, args, extra_metrics_cfg)
-        pc_preflight = asyncio.run(pc_service.preflight(report_date_for_check, pc_auth))
-        pc_ok = bool((pc_preflight or {}).get("ok"))
-        pc_message = str((pc_preflight or {}).get("message") or "")
+        pc_preflight = preflights.get("pc_web") or {}
+        pc_ok = bool(pc_preflight.get("ok"))
+        pc_message = str(pc_preflight.get("message") or "")
         logging.info("pc_web: %s", pc_message)
         if not pc_ok and strict_mode:
             raise ReportError(f"PC后台登录态预检失败: {pc_message}")
         if bool(pc_web_cfg.get("include_member_metrics", True)):
-            member_preflight = asyncio.run(pc_service.preflight_member(report_date_for_check, extra_auth.get("fenxi")))
-            member_ok = bool((member_preflight or {}).get("ok"))
-            member_msg = str((member_preflight or {}).get("message") or "")
+            member_preflight = preflights.get("pc_member") or {}
+            member_ok = bool(member_preflight.get("ok")) and bool(fenxi_diag.get("usable"))
+            member_msg = str(member_preflight.get("message") or "")
             logging.info("pc_member: %s", member_msg)
             if not bool(fenxi_diag.get("usable")):
-                member_ok = False
                 member_msg = f"{member_msg}; {fenxi_diag.get('message', '')}".strip("; ")
             if (not member_ok) and strict_mode:
                 raise ReportError(f"PC会员登录态预检失败: {member_msg}")
+    return extra_auth
 
 
 def _env_bool(name: str) -> Optional[bool]:
@@ -1080,12 +1190,12 @@ def run_full_auth_preflight_with_repair(
     extra_auth_file: Path,
     *,
     phase: str,
-) -> None:
+) -> Dict[str, Any]:
     report_date_for_check = resolve_report_date(args.date)
     try:
-        run_full_auth_preflight(config, args, extra_metrics_cfg, extra_auth_file)
+        extra_auth = run_full_auth_preflight(config, args, extra_metrics_cfg, extra_auth_file)
         write_run_state(Path(args.output), report_date_for_check, {"preflight_result": "ok", "last_phase": phase})
-        return
+        return extra_auth
     except ReportError as exc:
         reason_text = str(exc)
         write_run_state(
@@ -1131,12 +1241,13 @@ def run_full_auth_preflight_with_repair(
                 "auth_repair_log": result.get("log_path", ""),
             },
         )
-        run_full_auth_preflight(config, args, extra_metrics_cfg, extra_auth_file)
+        extra_auth = run_full_auth_preflight(config, args, extra_metrics_cfg, extra_auth_file)
         write_run_state(
             Path(args.output),
             report_date_for_check,
             {"preflight_result": "ok_after_repair", "last_phase": phase},
         )
+        return extra_auth
 
 
 def is_preflight_ok(value: Any) -> bool:
@@ -1859,6 +1970,9 @@ def generate_chart(
     output_path: Path,
 ) -> Optional[Path]:
     try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
         import matplotlib.pyplot as plt
         from matplotlib import gridspec
         configure_matplotlib_fonts()
@@ -2495,9 +2609,365 @@ def create_pc_web_service(
             hosts_yaml_path=str(pc_hosts_yaml_path).strip(),
             fenxi_base=str(extra_metrics_cfg.get("fenxi_base", "https://fenxi.4399dev.com")).strip(),
             timezone=str(extra_metrics_cfg.get("timezone", "Asia/Shanghai")),
-            max_concurrency=args.max_concurrency,
+            max_concurrency=min(args.max_concurrency, 4),
         )
     )
+
+
+def _target_chart_input(result: TargetResult) -> Dict[str, Any]:
+    def points(values: Sequence[TimePoint]) -> List[Tuple[str, Optional[float], Optional[int]]]:
+        return [
+            (point.timestamp.isoformat() if point.timestamp else point.raw_label, point.value, point.hour)
+            for point in values
+        ]
+
+    return {
+        "key": result.key,
+        "label": result.label,
+        "concurrency": points(result.concurrency.series),
+        "queue": points(result.queue.series),
+        "previous_concurrency_peak": result.previous_concurrency_peak,
+        "previous_queue_peak": result.previous_queue_peak,
+    }
+
+
+def collect_870_stage(context: RunContext, args: argparse.Namespace, cookie: str) -> Dict[str, TargetResult]:
+    started = monotonic_time.perf_counter()
+    config = dict(context.config.raw)
+    base_url = str(config.get("base_url") or "").strip()
+    timeout = float(config.get("timeout", 30))
+    network_cfg = config.get("network") or {}
+    hosts_yaml_path = (
+        args.network_hosts_yaml
+        if args.network_hosts_yaml is not None
+        else str(network_cfg.get("hosts_yaml_path") or "")
+    ).strip()
+    hosts_map = load_hosts_map(hosts_yaml_path) if hosts_yaml_path else {}
+    targets_config = config.get("targets") or {}
+    ordered_keys = config.get("report_section_order") or list(targets_config.keys())
+    configured_keys = [key for key in ordered_keys if targets_config.get(key)]
+    default_time_field = config.get("default_time_field", DEFAULT_TIME_FIELD)
+    default_http_method = config.get("default_http_method", "post")
+    auto_query_params = build_auto_query_params(config.get("auto_query_params"), context.report_date)
+    previous_auto_query_params = build_auto_query_params(
+        config.get("auto_query_params"),
+        context.report_date - timedelta(days=1),
+    )
+    metrics = current_metrics()
+    thread_state = threading.local()
+    created_sessions: List[requests.Session] = []
+    sessions_lock = threading.Lock()
+
+    def get_session() -> requests.Session:
+        session = getattr(thread_state, "session", None)
+        if session is not None:
+            return session
+        session = requests.Session()
+        configure_870_session(session, args, config)
+        session.headers.update({"Cookie": cookie, "User-Agent": config.get("user_agent", "Mozilla/5.0")})
+        if metrics is not None:
+            def record_response(response: requests.Response, *_args: Any, **_kwargs: Any) -> None:
+                retry_state = getattr(getattr(response, "raw", None), "retries", None)
+                retry_count = len(getattr(retry_state, "history", ()) or ())
+                metrics.increment("requests", 1 + retry_count)
+                if retry_count:
+                    metrics.increment("retries", retry_count)
+
+            session.hooks.setdefault("response", []).append(record_response)
+        thread_state.session = session
+        with sessions_lock:
+            created_sessions.append(session)
+        return session
+
+    def collect_target(key: str) -> TargetResult:
+        return build_target_result(
+            key=key,
+            config=targets_config[key],
+            session=get_session(),
+            base_url=base_url,
+            base_date=context.report_date,
+            previous_date=context.report_date - timedelta(days=1),
+            timeout=timeout,
+            default_time_field=default_time_field,
+            default_http_method=default_http_method,
+            auto_query_params=auto_query_params,
+            previous_auto_query_params=previous_auto_query_params,
+            hosts_map=hosts_map,
+        )
+
+    total_targets = max(1, len(configured_keys))
+    max_workers = min(args.max_concurrency, 4, total_targets)
+    emit_progress(15, f"并发抓取870数据（上限 {max_workers}）")
+    unordered: Dict[str, TargetResult] = {}
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="report-870") as executor:
+            futures = {executor.submit(collect_target, key): key for key in configured_keys}
+            for index, future in enumerate(as_completed(futures), start=1):
+                key = futures[future]
+                unordered[key] = future.result()
+                emit_progress(15 + int(index * 40 / total_targets), f"870数据完成：{key}")
+    finally:
+        for session in created_sessions:
+            session.close()
+
+    cache = context.shared.get("artifact_cache")
+    results: Dict[str, TargetResult] = {}
+    for key in configured_keys:
+        result = unordered[key]
+        if config.get("generate_charts", True) and not args.no_charts:
+            chart_path = context.charts_dir / f"{key}.png"
+            cache_key = f"chart:{context.report_date.isoformat()}:{key}"
+            input_hash = hash_payload([_target_chart_input(result)])
+            if isinstance(cache, ArtifactCache) and cache.is_fresh(cache_key, input_hash, [chart_path]):
+                result.chart_path = chart_path.relative_to(context.output_dir)
+                if metrics is not None:
+                    metrics.increment("chart_cache_hits")
+            else:
+                generated = generate_chart(result, chart_path)
+                if generated:
+                    result.chart_path = generated.relative_to(context.output_dir)
+                    if isinstance(cache, ArtifactCache):
+                        cache.update(cache_key, input_hash, [chart_path])
+                if metrics is not None:
+                    metrics.increment("chart_cache_misses")
+        results[key] = result
+    if isinstance(cache, ArtifactCache):
+        cache.save()
+    finish_stage_timing("collect_870", started, targets=len(results))
+    return results
+
+
+async def collect_extra_stage(
+    context: RunContext,
+    args: argparse.Namespace,
+    extra_metrics_cfg: Dict[str, Any],
+    timeout: float,
+) -> ExtraStageResult:
+    started = monotonic_time.perf_counter()
+    extra_metrics_data: Dict[str, Any] = {"notes": {}, "top_games": [], "warnings": [], "payment_tables": {}}
+    extra_auth = context.shared.get("extra_auth") or {}
+    if not isinstance(extra_auth, dict) or not extra_auth:
+        extra_metrics_data["warnings"].append(f"扩展认证文件不存在或不可用：{args.extra_auth_file}")
+    else:
+        extra_auth_file = Path(args.extra_auth_file)
+        auth_age_hours = get_extra_auth_age_hours(extra_auth_file, load_extra_auth_meta(extra_auth_file))
+        if auth_age_hours is not None and auth_age_hours > float(args.extra_auth_max_age_hours):
+            extra_metrics_data["warnings"].append(
+                f"扩展认证文件已超过{auth_age_hours:.1f}小时（阈值={args.extra_auth_max_age_hours}小时），"
+                "建议重新手机验证码登录并刷新认证文件。"
+            )
+        hosts_yaml_path = (
+            args.hosts_yaml_path
+            if args.hosts_yaml_path is not None
+            else str(extra_metrics_cfg.get("hosts_yaml_path", ""))
+        )
+        query_proxy_url = (
+            args.query_proxy_url
+            if args.query_proxy_url is not None
+            else str(extra_metrics_cfg.get("query_proxy_url", ""))
+        )
+        extra_service = ExtraMetricsService(
+            ExtraSettings(
+                timezone=str(extra_metrics_cfg.get("timezone", "Asia/Shanghai")),
+                request_timeout=int(extra_metrics_cfg.get("request_timeout", timeout)),
+                query_proxy_url=query_proxy_url.strip(),
+                hosts_yaml_path=hosts_yaml_path.strip(),
+                query_debug_log_path=(context.output_dir / "query_debug.jsonl"),
+                fenxi_base=str(extra_metrics_cfg.get("fenxi_base", "https://<FENXI_HOST>")).strip(),
+                manage_base=str(extra_metrics_cfg.get("manage_base", "http://<MANAGE_HOST>")).strip(),
+                max_concurrency=min(args.max_concurrency, 4),
+            )
+        )
+        extra_metrics_data = await extra_service.fetch(
+            query_date=context.report_date,
+            fenxi_auth=extra_auth.get("fenxi"),
+            manage_auth=extra_auth.get("505"),
+        )
+
+    payment_images: Dict[str, str] = {}
+    payment_tables = extra_metrics_data.get("payment_tables")
+    if isinstance(payment_tables, dict) and payment_tables:
+        date_key = context.report_date.strftime("%Y%m%d")
+        expected = {
+            key: context.charts_dir / f"505_{key}_payment_table_{date_key}.png"
+            for key in ("page", "mobile")
+            if key in payment_tables
+        }
+        cache = context.shared.get("artifact_cache")
+        cache_key = f"payment_tables:{context.report_date.isoformat()}"
+        input_hash = hash_payload([payment_tables])
+        metrics = current_metrics()
+        if expected and isinstance(cache, ArtifactCache) and cache.is_fresh(cache_key, input_hash, expected.values()):
+            rendered_paths = expected
+            if metrics is not None:
+                metrics.increment("payment_chart_cache_hits")
+        else:
+            try:
+                rendered_paths = await asyncio.to_thread(render_payment_table_images, payment_tables, context.charts_dir)
+            except Exception as exc:  # noqa: BLE001
+                rendered_paths = {}
+                warning = f"505图表生成失败: {exc}"
+                extra_metrics_data.setdefault("warnings", []).append(warning)
+                logging.warning(warning)
+            if isinstance(cache, ArtifactCache) and rendered_paths:
+                cache.update(cache_key, input_hash, rendered_paths.values())
+                cache.save()
+            if metrics is not None:
+                metrics.increment("payment_chart_cache_misses")
+        for key, path in rendered_paths.items():
+            try:
+                payment_images[str(key)] = str(Path(path).relative_to(context.output_dir))
+            except ValueError:
+                payment_images[str(key)] = str(path)
+        extra_metrics_data["payment_images"] = dict(payment_images)
+    rendered_block = render_extra_metrics_block(extra_metrics_data)
+    finish_stage_timing("extra_metrics", started, enabled=True)
+    return ExtraStageResult(data=extra_metrics_data, rendered_block=rendered_block, payment_images=payment_images)
+
+
+async def collect_pc_stage(
+    context: RunContext,
+    args: argparse.Namespace,
+    extra_metrics_cfg: Dict[str, Any],
+    pc_web_cfg: Dict[str, Any],
+) -> PCStageResult:
+    started = monotonic_time.perf_counter()
+    extra_auth = context.shared.get("extra_auth") or {}
+    if not isinstance(extra_auth, dict) or not extra_auth:
+        raise ReportError(f"PC后台数据抓取失败: 认证文件不存在或不可用：{args.extra_auth_file}")
+    pc_auth_key = str(pc_web_cfg.get("auth_key", "pc_web")).strip() or "pc_web"
+    pc_auth = extra_auth.get(pc_auth_key) or extra_auth.get("pc_web")
+    service = create_pc_web_service(dict(context.config.raw), args, extra_metrics_cfg)
+    strict = bool(pc_web_cfg.get("strict", True))
+    tasks = [
+        SourceTask(
+            "pc_web",
+            lambda: service.fetch(
+                query_date=context.report_date,
+                auth=pc_auth,
+                top_n=int(pc_web_cfg.get("top_n", 10)),
+            ),
+            strict=strict,
+        )
+    ]
+    if bool(pc_web_cfg.get("include_member_metrics", True)):
+        tasks.append(
+            SourceTask(
+                "pc_member",
+                lambda: service.fetch_member_metrics(
+                    query_date=context.report_date,
+                    fenxi_auth=extra_auth.get("fenxi"),
+                ),
+                strict=strict,
+            )
+        )
+    batch = await run_source_tasks(tasks, max_active_sources=2)
+    warnings: List[str] = []
+    for name, error in batch.errors.items():
+        message = f"{'PC会员' if name == 'pc_member' else 'PC后台'}数据抓取失败: {error}"
+        if strict:
+            raise ReportError(message) from error
+        warnings.append(message)
+    pc_data = batch.values.get("pc_web") or {}
+    member_data = batch.values.get("pc_member") or {}
+    result = PCStageResult(
+        notes=build_pc_notes(pc_data.get("notes") if isinstance(pc_data, dict) else {}),
+        member_summary=build_pc_member_summary(member_data.get("notes") if isinstance(member_data, dict) else {}),
+        top_games=build_pc_top_games(pc_data.get("top_games") if isinstance(pc_data, dict) else []),
+        warnings=warnings,
+    )
+    finish_stage_timing("pc_metrics", started, enabled=True)
+    return result
+
+
+async def collect_daily_sources(
+    context: RunContext,
+    args: argparse.Namespace,
+    cookie: str,
+    extra_metrics_cfg: Dict[str, Any],
+    pc_web_cfg: Dict[str, Any],
+    timeout: float,
+) -> Dict[str, Any]:
+    tasks = [SourceTask("870", lambda: asyncio.to_thread(collect_870_stage, context, args, cookie))]
+    if bool(args.with_extra_metrics or extra_metrics_cfg.get("enabled")):
+        tasks.append(SourceTask("extra", lambda: collect_extra_stage(context, args, extra_metrics_cfg, timeout), strict=False))
+    if bool(pc_web_cfg.get("enabled")):
+        tasks.append(SourceTask("pc", lambda: collect_pc_stage(context, args, extra_metrics_cfg, pc_web_cfg)))
+    async_request_limit = max(1, int(args.max_total_concurrency) - min(int(args.max_concurrency), 4))
+    with request_budget(async_request_limit):
+        batch = await run_source_tasks(tasks, max_active_sources=3)
+    extra_error = batch.errors.pop("extra", None)
+    if extra_error is not None:
+        warning = f"扩展指标请求失败: {extra_error}"
+        logging.warning(warning)
+        fallback_data = {"notes": {}, "top_games": [], "warnings": [warning], "payment_tables": {}}
+        batch.values["extra"] = ExtraStageResult(
+            data=fallback_data,
+            rendered_block=render_extra_metrics_block(fallback_data),
+        )
+    if batch.errors:
+        name, error = next(iter(batch.errors.items()))
+        if isinstance(error, ReportError):
+            raise error
+        raise ReportError(f"{name}数据阶段失败: {error}") from error
+    return batch.values
+
+
+@dataclass(frozen=True)
+class FeishuPublishJob:
+    target: str
+    report_text: str
+    report_date: date
+    title_override: str
+    title_prefix: str
+    report_base_dir: Path
+    chart_image_paths: Dict[str, str]
+    payment_images: Dict[str, str] = field(default_factory=dict)
+
+
+class FeishuPublishJobError(FeishuDocError):
+    def __init__(self, target: str, cause: FeishuDocError) -> None:
+        super().__init__(str(cause))
+        self.target = target
+
+
+def publish_feishu_jobs(
+    settings: FeishuDocSettings,
+    jobs: Sequence[FeishuPublishJob],
+) -> Dict[str, Tuple[Dict[str, str], float]]:
+    """Publish independent documents concurrently with one tenant token."""
+
+    if not jobs:
+        return {}
+    token = fetch_tenant_access_token(settings)
+
+    def publish(job: FeishuPublishJob) -> Tuple[Dict[str, str], float]:
+        started = monotonic_time.perf_counter()
+        result = publish_report_to_feishu_doc(
+            settings=settings,
+            report_text=job.report_text,
+            report_date=job.report_date,
+            title_override=job.title_override,
+            title_prefix=job.title_prefix,
+            report_base_dir=job.report_base_dir,
+            chart_image_paths=job.chart_image_paths,
+            payment_images=job.payment_images,
+            tenant_access_token=token,
+            image_upload_concurrency=3,
+        )
+        return result, monotonic_time.perf_counter() - started
+
+    worker_count = min(2, len(jobs))
+    results: Dict[str, Tuple[Dict[str, str], float]] = {}
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="feishu-doc") as executor:
+        futures = {executor.submit(publish, job): job.target for job in jobs}
+        for future in as_completed(futures):
+            target = futures[future]
+            try:
+                results[target] = future.result()
+            except FeishuDocError as exc:
+                raise FeishuPublishJobError(target, exc) from exc
+    return results
 
 
 def _prepare_runtime_paths(args: argparse.Namespace) -> None:
@@ -2519,14 +2989,28 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
     setup_logging(args.verbose)
     _prepare_runtime_paths(args)
-    if args.max_concurrency < 1:
-        raise ReportError("--max-concurrency 必须大于等于 1。")
-    lock_path = Path(args.output) / ".autodatareport.lock"
+    metrics = RunMetricsRecorder(Path(args.output), getattr(args, "date", None))
+    configure_runtime_telemetry(event_stream=args.event_stream, metrics=metrics)
     try:
-        with single_instance_lock(lock_path):
-            run_with_args(args)
-    except AlreadyRunningError as exc:
-        raise ReportError(str(exc)) from exc
+        if args.max_concurrency < 1:
+            raise ReportError("--max-concurrency 必须大于等于 1。")
+        if args.max_total_concurrency < 1:
+            raise ReportError("--max-total-concurrency 必须大于等于 1。")
+        lock_path = Path(args.output) / ".autodatareport.lock"
+        try:
+            with single_instance_lock(lock_path):
+                run_with_args(args)
+        except AlreadyRunningError as exc:
+            raise ReportError(str(exc)) from exc
+    except BaseException as exc:
+        metrics_path = metrics.finalize(status="error", error=f"{type(exc).__name__}: {exc}")
+        emit_event("run_finished", "pipeline", str(exc), progress=100, details={"status": "error", "metrics_path": str(metrics_path)})
+        raise
+    else:
+        metrics_path = metrics.finalize(status="ok")
+        emit_event("run_finished", "pipeline", "任务完成", progress=100, details={"status": "ok", "metrics_path": str(metrics_path)})
+    finally:
+        reset_runtime_telemetry()
 
 
 def run_with_args(args: argparse.Namespace) -> None:
@@ -2534,6 +3018,20 @@ def run_with_args(args: argparse.Namespace) -> None:
     emit_progress(2, "初始化参数")
 
     config = load_config(args.config)
+    options = RunOptions.from_namespace(args)
+    typed_config = AppConfig(config)
+    emit_event(
+        "run_started",
+        "pipeline",
+        "日报任务开始",
+        progress=2,
+        details={
+            "config": str(options.config),
+            "output": str(options.output),
+            "max_concurrency": options.max_concurrency,
+            "max_total_concurrency": options.max_total_concurrency,
+        },
+    )
     emit_progress(5, "加载配置完成")
     if args.push_report_file is not None:
         report_file = Path(args.push_report_file)
@@ -2569,6 +3067,9 @@ def run_with_args(args: argparse.Namespace) -> None:
             logging.info("Feishu doc published: %s", feishu_result.get("url", ""))
             if feishu_result.get("markdown_length"):
                 logging.info("Feishu doc markdown length: %s", feishu_result.get("markdown_length"))
+        except FeishuPublishJobError as exc:
+            label = "PC飞书文档" if exc.target == "pc" else "飞书文档"
+            raise ReportError(f"{label}推送失败: {exc}") from exc
         except FeishuDocError as exc:
             raise ReportError(f"飞书文档推送失败: {exc}") from exc
         emit_progress(100, "推送完成")
@@ -2725,14 +3226,14 @@ def run_with_args(args: argparse.Namespace) -> None:
 
     auth_started = monotonic_time.perf_counter()
     emit_progress(8, "执行全平台登录态预检")
-    run_full_auth_preflight_with_repair(
+    preflight_extra_auth = run_full_auth_preflight_with_repair(
         config,
         args,
         extra_metrics_cfg,
         extra_auth_file,
         phase="daily_report",
     )
-    logging.info("[TIMING] stage=auth_preflight seconds=%.3f", monotonic_time.perf_counter() - auth_started)
+    finish_stage_timing("auth_preflight", auth_started)
     emit_progress(10, "全平台登录态预检通过")
 
     report_date = resolve_report_date(args.date)
@@ -2740,86 +3241,49 @@ def run_with_args(args: argparse.Namespace) -> None:
     cookie = resolve_cookie(args.cookie, config)
     emit_progress(12, f"开始处理 {report_date.isoformat()} 数据")
     timeout = float(config.get("timeout", 30))
-    network_cfg = config.get("network") or {}
-    if not isinstance(network_cfg, dict):
-        raise ReportError("Config field network must be a mapping when provided.")
-    hosts_yaml_path_870 = (
-        args.network_hosts_yaml
-        if args.network_hosts_yaml is not None
-        else str(network_cfg.get("hosts_yaml_path") or "")
-    ).strip()
-    hosts_map_870 = load_hosts_map(hosts_yaml_path_870) if hosts_yaml_path_870 else {}
-    if hosts_map_870:
-        logging.info("870 hosts map loaded: %s (%d hosts)", hosts_yaml_path_870, len(hosts_map_870))
 
     targets_config = config.get("targets") or {}
     if not targets_config:
         raise ReportError("Config missing targets definitions.")
 
     ordered_section_keys = config.get("report_section_order") or list(targets_config.keys())
-    default_time_field = config.get("default_time_field", DEFAULT_TIME_FIELD)
-    default_http_method = config.get("default_http_method", "post")
-    auto_query_params = build_auto_query_params(config.get("auto_query_params"), report_date)
-    previous_auto_query_params = build_auto_query_params(
-        config.get("auto_query_params"),
-        report_date - timedelta(days=1),
-    )
     output_dir, charts_dir = ensure_output_dirs(args.output)
+    run_context = RunContext(
+        options=options,
+        config=typed_config,
+        report_date=report_date,
+        output_dir=output_dir,
+        charts_dir=charts_dir,
+    )
+    run_context.shared["extra_auth"] = preflight_extra_auth
+    run_context.shared["artifact_cache"] = ArtifactCache(output_dir)
 
-    collect_started = monotonic_time.perf_counter()
-    results: Dict[str, TargetResult] = {}
-    configured_keys: List[str] = []
-    for key in ordered_section_keys:
-        target_cfg = targets_config.get(key)
-        if not target_cfg:
-            logging.warning("Target %s is listed in order but missing configuration.", key)
-            continue
-        configured_keys.append(key)
-
-    def collect_target(key: str) -> TargetResult:
-        session = requests.Session()
-        try:
-            configure_870_session(session, args, config)
-            session.headers.update({"Cookie": cookie, "User-Agent": config.get("user_agent", "Mozilla/5.0")})
-            return build_target_result(
-                key=key,
-                config=targets_config[key],
-                session=session,
-                base_url=base_url,
-                base_date=report_date,
-                previous_date=report_date - timedelta(days=1),
-                timeout=timeout,
-                default_time_field=default_time_field,
-                default_http_method=default_http_method,
-                auto_query_params=auto_query_params,
-                previous_auto_query_params=previous_auto_query_params,
-                hosts_map=hosts_map_870,
-            )
-        finally:
-            session.close()
-
-    total_targets = max(1, len(configured_keys))
-    max_workers = min(args.max_concurrency, total_targets)
-    emit_progress(15, f"并发抓取870数据（上限 {max_workers}）")
-    unordered_results: Dict[str, TargetResult] = {}
-    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="report-870") as executor:
-        futures = {executor.submit(collect_target, key): key for key in configured_keys}
-        for idx, future in enumerate(as_completed(futures), start=1):
-            key = futures[future]
-            unordered_results[key] = future.result()
-            emit_progress(15 + int(idx * 40 / total_targets), f"870数据完成：{key}")
-
-    for key in configured_keys:
-        result = unordered_results[key]
-        if config.get("generate_charts", True) and not args.no_charts:
-            chart_filename = f"{key}.png"
-            chart_path = charts_dir / chart_filename
-            generated = generate_chart(result, chart_path)
-            if generated:
-                result.chart_path = generated.relative_to(output_dir)
-        results[key] = result
-    logging.info("[TIMING] stage=collect_870 seconds=%.3f", monotonic_time.perf_counter() - collect_started)
-    emit_progress(62, "870数据抓取完成")
+    pc_web_cfg = config.get("pc_web_metrics") or {}
+    if not isinstance(pc_web_cfg, dict):
+        raise ReportError("Config field pc_web_metrics must be a mapping when provided.")
+    if bool(args.with_extra_metrics or extra_metrics_cfg.get("enabled")):
+        emit_progress(62, "并行抓取扩展指标")
+    if bool(pc_web_cfg.get("enabled")):
+        emit_progress(68, "并行抓取PC后台数据")
+    source_values = asyncio.run(
+        collect_daily_sources(
+            run_context,
+            args,
+            cookie,
+            extra_metrics_cfg,
+            pc_web_cfg,
+            timeout,
+        )
+    )
+    results = source_values["870"]
+    extra_result = source_values.get("extra") or ExtraStageResult()
+    pc_result = source_values.get("pc") or PCStageResult()
+    extra_metrics_block = extra_result.rendered_block
+    extra_payment_images = dict(extra_result.payment_images)
+    pc_report_notes = dict(pc_result.notes)
+    pc_report_member_summary = dict(pc_result.member_summary)
+    pc_report_top_games = list(pc_result.top_games)
+    pc_report_warnings = list(pc_result.warnings)
 
     analysis_sentences: List[str] = []
     if config.get("analysis_groups"):
@@ -2827,128 +3291,6 @@ def run_with_args(args: argparse.Namespace) -> None:
     if config.get("anomaly_rules"):
         analysis_sentences.extend(build_anomaly_sentences(config["anomaly_rules"], results))
 
-    extra_metrics_enabled = bool(args.with_extra_metrics or extra_metrics_cfg.get("enabled"))
-    extra_metrics_block: Optional[str] = None
-    extra_payment_images: Dict[str, str] = {}
-    pc_report_notes: Dict[str, str] = {}
-    pc_report_member_summary: Dict[str, str] = {}
-    pc_report_top_games: List[Dict[str, str]] = []
-    pc_report_warnings: List[str] = []
-    extra_started = monotonic_time.perf_counter()
-    if extra_metrics_enabled:
-        emit_progress(68, "执行分析后台与505预检/抓取")
-        extra_metrics_data: Dict[str, Any] = {"notes": {}, "top_games": [], "warnings": [], "payment_tables": {}}
-        if not extra_auth_file.exists():
-            extra_metrics_data["warnings"].append(f"扩展认证文件不存在：{extra_auth_file}")
-        else:
-            extra_auth = load_extra_auth(extra_auth_file)
-            extra_auth_meta = load_extra_auth_meta(extra_auth_file)
-            auth_age_hours = get_extra_auth_age_hours(extra_auth_file, extra_auth_meta)
-            if auth_age_hours is not None and auth_age_hours > float(args.extra_auth_max_age_hours):
-                extra_metrics_data["warnings"].append(
-                    f"扩展认证文件已超过{auth_age_hours:.1f}小时（阈值={args.extra_auth_max_age_hours}小时），建议重新手机验证码登录并刷新认证文件。"
-                )
-            hosts_yaml_path = (
-                args.hosts_yaml_path
-                if args.hosts_yaml_path is not None
-                else str(extra_metrics_cfg.get("hosts_yaml_path", ""))
-            )
-            query_proxy_url = (
-                args.query_proxy_url
-                if args.query_proxy_url is not None
-                else str(extra_metrics_cfg.get("query_proxy_url", ""))
-            )
-            extra_settings = ExtraSettings(
-                timezone=str(extra_metrics_cfg.get("timezone", "Asia/Shanghai")),
-                request_timeout=int(extra_metrics_cfg.get("request_timeout", timeout)),
-                query_proxy_url=query_proxy_url.strip(),
-                hosts_yaml_path=hosts_yaml_path.strip(),
-                query_debug_log_path=(output_dir / "query_debug.jsonl"),
-                fenxi_base=str(extra_metrics_cfg.get("fenxi_base", "https://<FENXI_HOST>")).strip(),
-                manage_base=str(extra_metrics_cfg.get("manage_base", "http://<MANAGE_HOST>")).strip(),
-                max_concurrency=args.max_concurrency,
-            )
-            extra_service = ExtraMetricsService(extra_settings)
-            try:
-                extra_metrics_data = asyncio.run(
-                    extra_service.fetch(
-                        query_date=report_date,
-                        fenxi_auth=extra_auth.get("fenxi"),
-                        manage_auth=extra_auth.get("505"),
-                    )
-                )
-                payment_tables = extra_metrics_data.get("payment_tables")
-                if isinstance(payment_tables, dict) and payment_tables:
-                    try:
-                        payment_image_paths = render_payment_table_images(payment_tables, charts_dir)
-                        if payment_image_paths:
-                            payment_images: Dict[str, str] = {}
-                            for key, abs_path in payment_image_paths.items():
-                                try:
-                                    payment_images[key] = str(abs_path.relative_to(output_dir))
-                                except ValueError:
-                                    payment_images[key] = str(abs_path)
-                            extra_metrics_data["payment_images"] = payment_images
-                            extra_payment_images = dict(payment_images)
-                    except Exception as exc:  # pylint: disable=broad-except
-                        extra_metrics_data.setdefault("warnings", []).append(f"505图表生成失败: {exc}")
-                        logging.warning("Extra payment table image render failed: %s", exc)
-            except Exception as exc:  # pylint: disable=broad-except
-                extra_metrics_data = {"notes": {}, "top_games": [], "warnings": [f"扩展指标请求失败: {exc}"], "payment_tables": {}}
-                logging.warning("Extra metrics fetch failed: %s", exc)
-        if not extra_payment_images:
-            fallback_payment_images = extra_metrics_data.get("payment_images")
-            if isinstance(fallback_payment_images, dict):
-                extra_payment_images = {
-                    str(key): str(value)
-                    for key, value in fallback_payment_images.items()
-                    if str(value).strip()
-                }
-        extra_metrics_block = render_extra_metrics_block(extra_metrics_data)
-    logging.info("[TIMING] stage=extra_metrics seconds=%.3f", monotonic_time.perf_counter() - extra_started)
-
-    pc_web_cfg = config.get("pc_web_metrics") or {}
-    pc_started = monotonic_time.perf_counter()
-    if bool(pc_web_cfg.get("enabled")):
-        emit_progress(74, "抓取PC后台数据")
-        if not extra_auth_file.exists():
-            raise ReportError(f"PC后台数据抓取失败: 认证文件不存在：{extra_auth_file}")
-        extra_auth = load_extra_auth(extra_auth_file)
-        pc_auth_key = str(pc_web_cfg.get("auth_key", "pc_web")).strip() or "pc_web"
-        pc_auth = extra_auth.get(pc_auth_key) or extra_auth.get("pc_web")
-        pc_service = create_pc_web_service(config, args, extra_metrics_cfg)
-        strict_mode = bool(pc_web_cfg.get("strict", True))
-        try:
-            pc_web_data = asyncio.run(
-                pc_service.fetch(
-                    query_date=report_date,
-                    auth=pc_auth,
-                    top_n=int(pc_web_cfg.get("top_n", 10)),
-                )
-            )
-            pc_report_notes = build_pc_notes(pc_web_data.get("notes") if isinstance(pc_web_data, dict) else {})
-            pc_report_top_games = build_pc_top_games(pc_web_data.get("top_games") if isinstance(pc_web_data, dict) else [])
-        except Exception as exc:
-            if strict_mode:
-                raise ReportError(f"PC后台数据抓取失败: {exc}") from exc
-            pc_report_warnings.append(f"PC后台数据抓取失败: {exc}")
-
-        if bool(pc_web_cfg.get("include_member_metrics", True)):
-            try:
-                pc_member_data = asyncio.run(
-                    pc_service.fetch_member_metrics(
-                        query_date=report_date,
-                        fenxi_auth=extra_auth.get("fenxi"),
-                    )
-                )
-                pc_report_member_summary = build_pc_member_summary(
-                    pc_member_data.get("notes") if isinstance(pc_member_data, dict) else {}
-                )
-            except Exception as exc:
-                if strict_mode:
-                    raise ReportError(f"PC会员数据抓取失败: {exc}") from exc
-                pc_report_warnings.append(f"PC会员数据抓取失败: {exc}")
-    logging.info("[TIMING] stage=pc_metrics seconds=%.3f", monotonic_time.perf_counter() - pc_started)
     emit_progress(80, "渲染日报内容")
 
     render_started = monotonic_time.perf_counter()
@@ -2963,6 +3305,12 @@ def run_with_args(args: argparse.Namespace) -> None:
         extra_metrics_block=extra_metrics_block,
     )
     logging.info("Report generated: %s", output_path)
+    emit_event(
+        "artifact",
+        "render_reports",
+        "主日报已生成",
+        details={"target": "main", "path": str(output_path)},
+    )
     chart_image_paths = {
         key: str(result.chart_path)
         for key, result in results.items()
@@ -2983,25 +3331,40 @@ def run_with_args(args: argparse.Namespace) -> None:
             pc_warnings=pc_report_warnings,
         )
         logging.info("PC cloud report generated: %s", pc_report_path)
-    logging.info("[TIMING] stage=render_reports seconds=%.3f", monotonic_time.perf_counter() - render_started)
+        emit_event(
+            "artifact",
+            "render_reports",
+            "PC日报已生成",
+            details={"target": "pc", "path": str(pc_report_path)},
+        )
+    finish_stage_timing("render_reports", render_started)
 
     publish_store = PublishStateStore(output_dir, report_date)
-    feishu_settings: Optional[FeishuDocSettings] = None
     feishu_main_url = ""
+    feishu_pc_url = ""
     if should_push_feishu_doc(args, config):
         emit_progress(90, "推送飞书文档")
-        title_override, title_prefix = resolve_feishu_doc_title(args, config)
         feishu_settings = resolve_feishu_doc_settings(args, config)
+        publish_jobs: List[FeishuPublishJob] = []
+        publish_hashes: Dict[str, str] = {}
+
+        title_override, title_prefix = resolve_feishu_doc_title(args, config)
         main_hash = build_publish_hash(output_path, [*chart_image_paths.values(), *extra_payment_images.values()])
-        completed = None if args.force_publish else publish_store.completed_result("feishu_main", main_hash)
-        if completed is not None:
-            feishu_main_url = str(completed.get("url") or "").strip()
+        main_completed = None if args.force_publish else publish_store.completed_result("feishu_main", main_hash)
+        if main_completed is not None:
+            feishu_main_url = str(main_completed.get("url") or "").strip()
             logging.info("Feishu doc publish skipped (same content already completed): %s", feishu_main_url)
+            emit_event(
+                "publish_finished",
+                "publish_feishu_main",
+                "主日报内容未变化，已跳过重复发送",
+                details={"target": "main", "url": feishu_main_url, "skipped": True},
+            )
         else:
-            publish_started = monotonic_time.perf_counter()
-            try:
-                feishu_result = publish_report_to_feishu_doc(
-                    settings=feishu_settings,
+            publish_hashes["main"] = main_hash
+            publish_jobs.append(
+                FeishuPublishJob(
+                    target="main",
                     report_text=output_path.read_text(encoding="utf-8"),
                     report_date=report_date,
                     title_override=title_override,
@@ -3010,35 +3373,30 @@ def run_with_args(args: argparse.Namespace) -> None:
                     chart_image_paths=chart_image_paths,
                     payment_images=extra_payment_images,
                 )
-                feishu_main_url = str(feishu_result.get("url") or "").strip()
-                publish_store.mark_completed("feishu_main", main_hash, {"url": feishu_main_url})
-                logging.info("Feishu doc published: %s", feishu_main_url)
-                logging.info("[TIMING] stage=publish_feishu_main seconds=%.3f", monotonic_time.perf_counter() - publish_started)
-                if feishu_result.get("markdown_length"):
-                    logging.info("Feishu doc markdown length: %s", feishu_result.get("markdown_length"))
-            except FeishuDocError as exc:
-                raise ReportError(f"飞书文档推送失败: {exc}") from exc
+            )
 
-    feishu_pc_url = ""
-    if pc_target and pc_report_path is not None:
-        if feishu_settings is None and should_push_feishu_doc(args, config):
-            feishu_settings = resolve_feishu_doc_settings(args, config)
-        if feishu_settings is not None and should_push_feishu_pc_doc(config):
+        if pc_target and pc_report_path is not None and should_push_feishu_pc_doc(config):
             emit_progress(95, "推送PC飞书文档")
             pc_title_override, pc_title_prefix = resolve_feishu_pc_doc_title(config)
             pc_chart_image_paths: Dict[str, str] = {}
             if pc_target.chart_path is not None:
                 pc_chart_image_paths["pc_cloud"] = str(pc_target.chart_path)
             pc_hash = build_publish_hash(pc_report_path, pc_chart_image_paths.values())
-            completed = None if args.force_publish else publish_store.completed_result("feishu_pc", pc_hash)
-            if completed is not None:
-                feishu_pc_url = str(completed.get("url") or "").strip()
+            pc_completed = None if args.force_publish else publish_store.completed_result("feishu_pc", pc_hash)
+            if pc_completed is not None:
+                feishu_pc_url = str(pc_completed.get("url") or "").strip()
                 logging.info("Feishu PC doc publish skipped (same content already completed): %s", feishu_pc_url)
+                emit_event(
+                    "publish_finished",
+                    "publish_feishu_pc",
+                    "PC日报内容未变化，已跳过重复发送",
+                    details={"target": "pc", "url": feishu_pc_url, "skipped": True},
+                )
             else:
-                publish_started = monotonic_time.perf_counter()
-                try:
-                    pc_result = publish_report_to_feishu_doc(
-                        settings=feishu_settings,
+                publish_hashes["pc"] = pc_hash
+                publish_jobs.append(
+                    FeishuPublishJob(
+                        target="pc",
                         report_text=pc_report_path.read_text(encoding="utf-8"),
                         report_date=report_date,
                         title_override=pc_title_override,
@@ -3046,14 +3404,31 @@ def run_with_args(args: argparse.Namespace) -> None:
                         report_base_dir=pc_report_path.parent,
                         chart_image_paths=pc_chart_image_paths,
                     )
-                    feishu_pc_url = str(pc_result.get("url") or "").strip()
-                    publish_store.mark_completed("feishu_pc", pc_hash, {"url": feishu_pc_url})
-                    logging.info("Feishu PC doc published: %s", feishu_pc_url)
-                    logging.info("[TIMING] stage=publish_feishu_pc seconds=%.3f", monotonic_time.perf_counter() - publish_started)
-                    if pc_result.get("markdown_length"):
-                        logging.info("Feishu PC doc markdown length: %s", pc_result.get("markdown_length"))
-                except FeishuDocError as exc:
-                    raise ReportError(f"PC飞书文档推送失败: {exc}") from exc
+                )
+
+        try:
+            publish_results = publish_feishu_jobs(feishu_settings, publish_jobs)
+        except FeishuDocError as exc:
+            raise ReportError(f"飞书文档推送失败: {exc}") from exc
+        for target, (result, elapsed) in publish_results.items():
+            url = str(result.get("url") or "").strip()
+            state_key = f"feishu_{target}"
+            publish_store.mark_completed(state_key, publish_hashes[target], {"url": url})
+            logging.info("Feishu%s doc published: %s", " PC" if target == "pc" else "", url)
+            finish_stage_timing(f"publish_feishu_{target}", monotonic_time.perf_counter() - elapsed)
+            emit_event(
+                "publish_finished",
+                f"publish_feishu_{target}",
+                "PC日报已发送" if target == "pc" else "主日报已发送",
+                duration_seconds=elapsed,
+                details={"target": target, "url": url, "skipped": False},
+            )
+            if target == "pc":
+                feishu_pc_url = url
+            else:
+                feishu_main_url = url
+            if result.get("markdown_length"):
+                logging.info("Feishu%s doc markdown length: %s", " PC" if target == "pc" else "", result.get("markdown_length"))
 
     if should_push_wecom_bot(config, args):
         auto_targets = resolve_wecom_auto_targets(config)
@@ -3084,7 +3459,7 @@ def run_with_args(args: argparse.Namespace) -> None:
                 if strict:
                     raise ReportError(f"企业微信推送失败({target}): {exc}") from exc
                 logging.warning("WeCom bot push failed target=%s: %s", target, exc)
-    logging.info("[TIMING] stage=total seconds=%.3f", monotonic_time.perf_counter() - total_started)
+    finish_stage_timing("total", total_started)
     emit_progress(100, "任务完成")
 
 

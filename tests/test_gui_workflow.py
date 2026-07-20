@@ -53,8 +53,13 @@ class GuiWorkflowTests(unittest.TestCase):
         app._update_option_summary()
         self.assertEqual(app.run_button_text.get(), "仅生成昨天日报")
 
-    def test_gui_version_is_v12(self) -> None:
-        self.assertEqual(ReportLauncherApp.APP_VERSION, "1.2")
+    def test_gui_enables_v13_event_stream_and_global_limit(self) -> None:
+        command = self.make_app()._build_command()
+        self.assertEqual(ReportLauncherApp.APP_VERSION, "1.3")
+        self.assertIn("--event-stream", command)
+        self.assertIn("jsonl", command)
+        self.assertIn("--max-total-concurrency", command)
+        self.assertIn("8", command)
 
 
 if __name__ == "__main__":

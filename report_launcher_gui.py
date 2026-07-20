@@ -11,7 +11,7 @@ import threading
 import webbrowser
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 import tkinter as tk
@@ -21,6 +21,8 @@ import yaml
 from app_paths import ensure_first_run_config, migrate_legacy_runtime_files, resolve_app_paths
 from auth_repair import classify_auth_failure
 from browser_auth_refresh import BrowserRefreshSettings, refresh_extra_auth_from_browser
+from autodatareport.gui_runtime import GuiEvent, parse_event_line
+from autodatareport.process_runner import TaskProcessRunner
 from fenxi_auth_from_har import refresh_fenxi_auth_from_hars
 from pc_auth_from_har import refresh_pc_auth_from_hars
 
@@ -32,7 +34,7 @@ FEISHU_PC_URL_RE = re.compile(r"Feishu PC doc published:\s*(https?://\S+)")
 
 class ReportLauncherApp:
     LAUNCHD_LABEL = "com.starfish.autodatareport.daily"
-    APP_VERSION = "1.2"
+    APP_VERSION = "1.3"
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -55,9 +57,10 @@ class ReportLauncherApp:
         self.python_bin = self._resolve_python_bin()
 
         self.process: Optional[subprocess.Popen[str]] = None
+        self.process_runner = TaskProcessRunner()
         self.worker_thread: Optional[threading.Thread] = None
         self.aux_running = False
-        self.queue: "queue.Queue[tuple[str, str | int]]" = queue.Queue()
+        self.queue: "queue.Queue[tuple[str, Any]]" = queue.Queue()
 
         self.date_mode = tk.StringVar(value="yesterday")
         self.date_value = tk.StringVar(value=(date.today() - timedelta(days=1)).isoformat())
@@ -576,6 +579,10 @@ class ReportLauncherApp:
             "--no-runtime-gui",
             "--extra-auth-file",
             str(extra_auth_file),
+            "--event-stream",
+            "jsonl",
+            "--max-total-concurrency",
+            "8",
         )
         if self.with_extra.get():
             cmd.append("--with-extra-metrics")
@@ -691,18 +698,13 @@ class ReportLauncherApp:
 
         def _worker() -> None:
             try:
-                self.process = subprocess.Popen(
-                    cmd,
-                    cwd=str(self.project_root),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    env=env,
-                )
-                assert self.process.stdout is not None
-                for raw_line in self.process.stdout:
-                    line = raw_line.rstrip("\n")
+                self.process = self.process_runner.open(cmd, cwd=self.project_root, env=env)
+
+                def handle_line(line: str) -> None:
+                    event = parse_event_line(line)
+                    if event is not None:
+                        self.queue.put(("event", event))
+                        return
                     self.queue.put(("line", line))
                     progress_match = PROGRESS_RE.search(line)
                     if progress_match:
@@ -717,7 +719,8 @@ class ReportLauncherApp:
                         main_url_match = FEISHU_MAIN_URL_RE.search(line)
                         if main_url_match:
                             self.queue.put(("feishu_main", main_url_match.group(1).strip()))
-                rc = self.process.wait()
+
+                rc = self.process_runner.stream(self.process, handle_line)
                 self.queue.put(("done", rc))
             except Exception as exc:  # noqa: BLE001
                 self.queue.put(("line", f"[GUI ERROR] {exc}"))
@@ -730,7 +733,7 @@ class ReportLauncherApp:
         if self.process is None:
             return
         try:
-            self.process.terminate()
+            self.process_runner.terminate(self.process)
         except Exception:  # noqa: BLE001
             pass
         self.status_text.set("已请求停止")
@@ -755,6 +758,21 @@ class ReportLauncherApp:
                     if main_url_match:
                         self.feishu_url_main.set(main_url_match.group(1).strip())
                         self._set_feishu_menu_state()
+            elif kind == "event":
+                event = value
+                if not isinstance(event, GuiEvent):
+                    continue
+                self._append_log("[EVENT] " + event.log_line())
+                if event.progress is not None:
+                    self._set_progress(event.progress, event.message or None)
+                elif event.message and event.kind in {"stage_started", "artifact", "publish_finished"}:
+                    self.status_text.set(event.message)
+                if event.url and event.target == "pc":
+                    self.feishu_url_pc.set(event.url)
+                    self._set_feishu_menu_state()
+                elif event.url and event.target == "main":
+                    self.feishu_url_main.set(event.url)
+                    self._set_feishu_menu_state()
             elif kind == "progress":
                 self._set_progress(int(value))
             elif kind == "status":

@@ -11,8 +11,9 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from autodatareport.events import current_metrics
 
-from async_utils import gather_limited
+from async_utils import RetryingAsyncClient, gather_limited
 from network_hosts import load_hosts_map, rewrite_url_with_hosts_map
 from tz_compat import get_tzinfo
 
@@ -321,6 +322,20 @@ class PCWebMetricsService:
         if not self.fenxi_base:
             self.fenxi_base = "https://fenxi.4399dev.com"
 
+    async def _record_request(self, _request: httpx.Request) -> None:
+        metrics = current_metrics()
+        if metrics is not None:
+            metrics.increment("requests")
+
+    def _client(self) -> httpx.AsyncClient:
+        return RetryingAsyncClient(
+            timeout=self.settings.request_timeout,
+            follow_redirects=True,
+            proxy=self.settings.query_proxy_url or None,
+            trust_env=False,
+            event_hooks={"request": [self._record_request]},
+        )
+
     async def preflight(self, query_date: date, auth: dict[str, Any] | None) -> dict[str, Any]:
         if not auth:
             return {"ok": False, "message": "PC网页端认证信息缺失"}
@@ -349,12 +364,7 @@ class PCWebMetricsService:
             offset = self._date_offset(query_date)
             payload_probe = self._payload_pc_member_total_single(offset)
             auth_headers = self._auth_headers(fenxi_auth)
-            async with httpx.AsyncClient(
-                timeout=self.settings.request_timeout,
-                follow_redirects=True,
-                proxy=self.settings.query_proxy_url or None,
-                trust_env=False,
-            ) as client:
+            async with self._client() as client:
                 self._apply_auth(client, fenxi_auth)
                 await self._fenxi_module_switch(client, auth_headers)
                 probe_data = await self._fenxi_render_data(client, PC_MEMBER_COMPONENT_TOTAL, payload_probe, auth_headers)
@@ -379,12 +389,7 @@ class PCWebMetricsService:
         payload_total_week_single = self._payload_pc_member_total_single(offset - 7)
         auth_headers = self._auth_headers(fenxi_auth)
 
-        async with httpx.AsyncClient(
-            timeout=self.settings.request_timeout,
-            follow_redirects=True,
-            proxy=self.settings.query_proxy_url or None,
-            trust_env=False,
-        ) as client:
+        async with self._client() as client:
             self._apply_auth(client, fenxi_auth)
             await self._fenxi_module_switch(client, auth_headers)
             total_data, first_data, trend_data, total_today_single, total_week_single = await gather_limited(
@@ -434,12 +439,7 @@ class PCWebMetricsService:
             "gameids": "",
         }
 
-        async with httpx.AsyncClient(
-            timeout=self.settings.request_timeout,
-            follow_redirects=True,
-            proxy=self.settings.query_proxy_url or None,
-            trust_env=False,
-        ) as client:
+        async with self._client() as client:
             self._apply_auth(client, auth)
             resp = await client.post(url, data=data, headers=headers)
 

@@ -1,8 +1,8 @@
 @echo off
 setlocal
 
-set "APP_VERSION=1.2.0"
-set "RELEASE_DIR=dist\windows-release-v1.2.0"
+set "APP_VERSION=1.3.0"
+set "RELEASE_DIR=dist\windows-release-v1.3.0"
 
 where uv >nul 2>&1
 if errorlevel 1 (
@@ -15,7 +15,7 @@ uv sync --frozen --group build
 if errorlevel 1 goto :fail
 set "PYTHON_EXE=%CD%\.venv\Scripts\python.exe"
 
-echo Cleaning previous V1.2 build output...
+echo Cleaning previous V1.3 build output...
 if exist "%RELEASE_DIR%" rmdir /s /q "%RELEASE_DIR%"
 if exist "%RELEASE_DIR%" (
     echo Failed to clean %RELEASE_DIR%. Close running EXE files and try again.
