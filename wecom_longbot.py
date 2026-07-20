@@ -8,10 +8,12 @@ import json
 import logging
 import os
 import re
+import socket
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Sequence
+from urllib.parse import urlparse
 
 import websockets
 
@@ -46,6 +48,18 @@ def _make_req_id(prefix: str) -> str:
 
 def _json_dumps(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _describe_ws_connect_error(ws_url: str, exc: BaseException) -> str:
+    parsed = urlparse(str(ws_url or ""))
+    host = parsed.hostname or str(ws_url or "").strip() or "-"
+    if isinstance(exc, socket.gaierror):
+        return f"企业微信 WebSocket 连接失败：无法解析域名 {host}，请检查 DNS、网络或代理设置。底层错误：{exc}"
+    if isinstance(exc, TimeoutError):
+        return f"企业微信 WebSocket 连接超时：{host}。请检查网络是否可访问企业微信开放平台。底层错误：{exc}"
+    if isinstance(exc, OSError):
+        return f"企业微信 WebSocket 连接失败：{host}。请检查网络、防火墙或代理设置。底层错误：{exc}"
+    return f"企业微信 WebSocket 连接失败：{host}。{type(exc).__name__}: {exc}"
 
 
 def _normalize_report_text(report_text: str) -> str:
@@ -121,7 +135,8 @@ def build_wecom_markdown_messages(title: str, report_text: str, max_length: int 
 def build_wecom_image_body(image_path: Path) -> Dict[str, Any]:
     data = image_path.read_bytes()
     encoded = base64.b64encode(data).decode("ascii")
-    md5_hex = hashlib.md5(data).hexdigest()
+    # The WeCom image protocol requires MD5 as a transport checksum, not for security.
+    md5_hex = hashlib.md5(data, usedforsecurity=False).hexdigest()
     return {
         "msgtype": "image",
         "image": {
@@ -152,23 +167,28 @@ class WeComLongBotClient:
             "max_size": 8 * 1024 * 1024,
             "proxy": None,
         }
-        async with websockets.connect(self.settings.ws_url, **connect_kwargs) as ws:
-            await self._subscribe(ws)
-            responses: List[Dict[str, Any]] = []
-            image_send_supported = True
-            for body in clean_bodies:
-                msgtype = str(body.get("msgtype") or "").strip().lower()
-                if msgtype == "image" and not image_send_supported:
-                    continue
-                try:
-                    responses.append(await self._send_body(ws, chatid, body))
-                except WeComBotSendError as exc:
-                    if msgtype == "image" and exc.errcode == 40008:
-                        image_send_supported = False
-                        logging.warning("WeCom long-bot active push does not support image messages; skip remaining images.")
+        try:
+            async with websockets.connect(self.settings.ws_url, **connect_kwargs) as ws:
+                await self._subscribe(ws)
+                responses: List[Dict[str, Any]] = []
+                image_send_supported = True
+                for body in clean_bodies:
+                    msgtype = str(body.get("msgtype") or "").strip().lower()
+                    if msgtype == "image" and not image_send_supported:
                         continue
-                    raise
-            return responses
+                    try:
+                        responses.append(await self._send_body(ws, chatid, body))
+                    except WeComBotSendError as exc:
+                        if msgtype == "image" and exc.errcode == 40008:
+                            image_send_supported = False
+                            logging.warning("WeCom long-bot active push does not support image messages; skip remaining images.")
+                            continue
+                        raise
+                return responses
+        except WeComBotError:
+            raise
+        except (OSError, TimeoutError) as exc:
+            raise WeComBotError(_describe_ws_connect_error(self.settings.ws_url, exc)) from exc
 
     async def _subscribe(self, ws: websockets.WebSocketClientProtocol) -> None:
         req_id = _make_req_id("aibot_subscribe")
@@ -209,7 +229,10 @@ class WeComLongBotClient:
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=self.settings.ack_timeout)
             except asyncio.TimeoutError as exc:
-                raise WeComBotError(f"企业微信等待回执超时 req_id={req_id}") from exc
+                raise WeComBotError(
+                    f"企业微信等待回执超时（{self.settings.ack_timeout:g}s）req_id={req_id}。"
+                    "请检查 bot_id/secret、chatid/userid 是否正确，或适当调大 wecom_bot.ack_timeout。"
+                ) from exc
 
             text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
             try:
@@ -269,7 +292,12 @@ def publish_reports_to_wecom(
             all_bodies.append(build_wecom_image_body(path))
     if not all_bodies:
         raise WeComBotError("没有可推送到企业微信的日报内容")
-    responses = asyncio.run(WeComLongBotClient(settings).send_messages(chatid=chatid, bodies=all_bodies))
+    try:
+        responses = asyncio.run(WeComLongBotClient(settings).send_messages(chatid=chatid, bodies=all_bodies))
+    except WeComBotError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise WeComBotError(f"企业微信推送异常：{type(exc).__name__}: {exc}") from exc
     return {
         "ok": True,
         "chatid": chatid,

@@ -12,8 +12,14 @@ ENV_FILE="${ENV_FILE:-${ROOT_DIR}/.env.scheduler}"
 
 MAX_RETRIES="${MAX_RETRIES:-3}"
 RETRY_DELAY_SECONDS="${RETRY_DELAY_SECONDS:-300}"
-DATE_MODE="${DATE_MODE:-today}" # today | yesterday
+DATE_MODE="${DATE_MODE:-yesterday}" # today | yesterday
 RUN_AUTH_CHECK="${RUN_AUTH_CHECK:-1}"
+RUN_AUTH_REPAIR="${RUN_AUTH_REPAIR:-1}"
+AUTH_REPAIR_ONLY="${AUTH_REPAIR_ONLY:-0}"
+AUTH_REPAIR_BROWSER="${AUTH_REPAIR_BROWSER:-chrome}"
+AUTH_REPAIR_PROFILE="${AUTH_REPAIR_PROFILE:-${ROOT_DIR}/output/auth_profiles/chrome_daily_report}"
+AUTH_REPAIR_TIMEOUT_SECONDS="${AUTH_REPAIR_TIMEOUT_SECONDS:-300}"
+AUTH_REPAIR_TARGET="${AUTH_REPAIR_TARGET:-auto}"
 VERIFY_FEISHU_CONTENT="${VERIFY_FEISHU_CONTENT:-0}"
 DISABLE_FEISHU_PUSH="${DISABLE_FEISHU_PUSH:-0}"
 
@@ -63,11 +69,41 @@ LOG_FILE="${LOG_DIR}/daily_$(date +%Y%m%d_%H%M%S).log"
   echo "[$(date '+%F %T')] config=${CONFIG_PATH}"
 } | tee -a "${LOG_FILE}"
 
+REPAIR_ARGS=()
+if [[ "${RUN_AUTH_REPAIR}" == "1" ]]; then
+  REPAIR_ARGS+=("--repair-auth-on-failure")
+fi
+if [[ -n "${AUTH_REPAIR_BROWSER}" ]]; then
+  REPAIR_ARGS+=("--auth-repair-browser" "${AUTH_REPAIR_BROWSER}")
+fi
+if [[ -n "${AUTH_REPAIR_PROFILE}" ]]; then
+  REPAIR_ARGS+=("--auth-repair-profile" "${AUTH_REPAIR_PROFILE}")
+fi
+if [[ -n "${AUTH_REPAIR_TARGET}" ]]; then
+  REPAIR_ARGS+=("--auth-repair-target" "${AUTH_REPAIR_TARGET}")
+fi
+REPAIR_ARGS+=("--auth-repair-timeout-seconds" "${AUTH_REPAIR_TIMEOUT_SECONDS}")
+
 if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
   echo "[$(date '+%F %T')] another run is in progress, skip." | tee -a "${LOG_FILE}"
   exit 0
 fi
 trap 'rm -rf "${LOCK_DIR}"' EXIT
+
+if [[ "${AUTH_REPAIR_ONLY}" == "1" ]]; then
+  AUTH_REPAIR_CMD=(
+    "${PYTHON_BIN}" "${ROOT_DIR}/generate_daily_report.py"
+    "--config" "${CONFIG_PATH}"
+    "--date" "${REPORT_DATE}"
+    "--with-extra-metrics"
+    "--repair-auth-only"
+    "${REPAIR_ARGS[@]}"
+  )
+  echo "[$(date '+%F %T')] auth repair only..." | tee -a "${LOG_FILE}"
+  "${AUTH_REPAIR_CMD[@]}" 2>&1 | tee -a "${LOG_FILE}"
+  echo "[$(date '+%F %T')] auth repair success." | tee -a "${LOG_FILE}"
+  exit 0
+fi
 
 if [[ "${RUN_AUTH_CHECK}" == "1" ]]; then
   AUTH_CMD=(
@@ -75,6 +111,7 @@ if [[ "${RUN_AUTH_CHECK}" == "1" ]]; then
     "--config" "${CONFIG_PATH}"
     "--check-extra-auth"
     "--date" "${REPORT_DATE}"
+    "${REPAIR_ARGS[@]}"
   )
   echo "[$(date '+%F %T')] auth precheck..." | tee -a "${LOG_FILE}"
   set +e
@@ -92,6 +129,7 @@ RUN_CMD=(
   "--config" "${CONFIG_PATH}"
   "--date" "${REPORT_DATE}"
   "--with-extra-metrics"
+  "${REPAIR_ARGS[@]}"
 )
 if [[ "${VERIFY_FEISHU_CONTENT}" == "1" ]]; then
   RUN_CMD+=("--verify-feishu-content")

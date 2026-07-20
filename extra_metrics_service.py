@@ -10,11 +10,12 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
-from zoneinfo import ZoneInfo
 
 import httpx
 
+from async_utils import gather_limited
 from network_hosts import load_hosts_map, rewrite_url_with_hosts_map
+from tz_compat import get_tzinfo
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class ExtraSettings:
     query_debug_log_path: Path
     fenxi_base: str
     manage_base: str
+    max_concurrency: int = 4
 
 
 class DebugLogStore:
@@ -36,10 +38,24 @@ class DebugLogStore:
             self.path.write_text("", encoding="utf-8")
 
     def write(self, event: dict[str, Any]) -> None:
+        self._rotate_if_needed()
         item = dict(event)
         item.setdefault("ts", datetime.now(timezone.utc).isoformat())
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    def _rotate_if_needed(self, max_bytes: int = 5 * 1024 * 1024, backups: int = 3) -> None:
+        if not self.path.exists() or self.path.stat().st_size < max_bytes:
+            return
+        oldest = self.path.with_name(f"{self.path.name}.{backups}")
+        if oldest.exists():
+            oldest.unlink()
+        for index in range(backups - 1, 0, -1):
+            source = self.path.with_name(f"{self.path.name}.{index}")
+            if source.exists():
+                source.replace(self.path.with_name(f"{self.path.name}.{index + 1}"))
+        self.path.replace(self.path.with_name(f"{self.path.name}.1"))
+        self.path.write_text("", encoding="utf-8")
 
     def tail(self, lines: int = 200) -> list[dict[str, Any]]:
         raw = self.path.read_text(encoding="utf-8").splitlines()
@@ -391,10 +407,15 @@ class ExtraMetricsService:
             self._apply_auth(client, auth)
             await self._fenxi_module_switch(client, auth_headers)
 
-            active_last_day = await self._fenxi_event_query(client, self._build_active_payload(query_date, "LAST_PERIOD"), auth_headers)
-            active_last_week = await self._fenxi_event_query(client, self._build_active_payload(query_date, "LAST_WEEK"), auth_headers)
-            new_last_day = await self._fenxi_event_query(client, self._build_new_payload(query_date, "LAST_PERIOD"), auth_headers)
-            new_last_week = await self._fenxi_event_query(client, self._build_new_payload(query_date, "LAST_WEEK"), auth_headers)
+            active_last_day, active_last_week, new_last_day, new_last_week = await gather_limited(
+                [
+                    self._fenxi_event_query(client, self._build_active_payload(query_date, "LAST_PERIOD"), auth_headers),
+                    self._fenxi_event_query(client, self._build_active_payload(query_date, "LAST_WEEK"), auth_headers),
+                    self._fenxi_event_query(client, self._build_new_payload(query_date, "LAST_PERIOD"), auth_headers),
+                    self._fenxi_event_query(client, self._build_new_payload(query_date, "LAST_WEEK"), auth_headers),
+                ],
+                self.settings.max_concurrency,
+            )
 
             notes["active_users"] = self._extract_compare_metric(active_last_day, active_last_week)
             notes["new_users"] = self._extract_compare_metric(new_last_day, new_last_week)
@@ -416,9 +437,14 @@ class ExtraMetricsService:
             member_recharge_payload = self._payload_member_recharge(offset)
             member_daily_payload = self._payload_member_daily(offset)
 
-            pay_rate_data = await self._fenxi_render_data(client, FENXI_COMPONENT_PAY_RATE, pay_rate_payload, auth_headers)
-            member_recharge_data = await self._fenxi_render_data(client, FENXI_COMPONENT_MEMBER_RECHARGE, member_recharge_payload, auth_headers)
-            member_daily_data = await self._fenxi_render_data(client, FENXI_COMPONENT_MEMBER_DAILY, member_daily_payload, auth_headers)
+            pay_rate_data, member_recharge_data, member_daily_data = await gather_limited(
+                [
+                    self._fenxi_render_data(client, FENXI_COMPONENT_PAY_RATE, pay_rate_payload, auth_headers),
+                    self._fenxi_render_data(client, FENXI_COMPONENT_MEMBER_RECHARGE, member_recharge_payload, auth_headers),
+                    self._fenxi_render_data(client, FENXI_COMPONENT_MEMBER_DAILY, member_daily_payload, auth_headers),
+                ],
+                self.settings.max_concurrency,
+            )
 
             pay_rate_row = self._first_row(pay_rate_data)
             recharge_row = self._first_row(member_recharge_data)
@@ -430,7 +456,7 @@ class ExtraMetricsService:
 
             if recharge_row:
                 notes["member_recharge_amount"] = self._to_int(recharge_row.get("2quuthxeb6el"))
-                notes["member_recharge_week_ratio"] = str(recharge_row.get("r717ar12dmx0") or "")
+                notes["member_recharge_week_ratio"] = self._normalize_ratio_text(recharge_row.get("r717ar12dmx0"))
 
             if daily_row:
                 notes["member_valid_count"] = self._to_int(daily_row.get("ngins6tydctq"))
@@ -452,12 +478,24 @@ class ExtraMetricsService:
             self._apply_auth(client, auth)
             await self._bootstrap_callback(client, auth, hosts_map)
 
-            web_0, web_0_rows = await self._manage_recharge_detail(client, hosts_map, "gz_web", d0, auth_headers)
-            web_7, web_7_rows = await self._manage_recharge_detail(client, hosts_map, "gz_web", d7, auth_headers)
-            xm_0, xm_0_rows = await self._manage_recharge_detail(client, hosts_map, "xiamen_night", d0, auth_headers)
-            xm_7, xm_7_rows = await self._manage_recharge_detail(client, hosts_map, "xiamen_night", d7, auth_headers)
-            mobile_0, mobile_0_rows = await self._manage_recharge_detail(client, hosts_map, "mobile_game", d0, auth_headers)
-            mobile_7, mobile_7_rows = await self._manage_recharge_detail(client, hosts_map, "mobile_game", d7, auth_headers)
+            (
+                (web_0, web_0_rows),
+                (web_7, web_7_rows),
+                (xm_0, xm_0_rows),
+                (xm_7, xm_7_rows),
+                (mobile_0, mobile_0_rows),
+                (mobile_7, mobile_7_rows),
+            ) = await gather_limited(
+                [
+                    self._manage_recharge_detail(client, hosts_map, "gz_web", d0, auth_headers),
+                    self._manage_recharge_detail(client, hosts_map, "gz_web", d7, auth_headers),
+                    self._manage_recharge_detail(client, hosts_map, "xiamen_night", d0, auth_headers),
+                    self._manage_recharge_detail(client, hosts_map, "xiamen_night", d7, auth_headers),
+                    self._manage_recharge_detail(client, hosts_map, "mobile_game", d0, auth_headers),
+                    self._manage_recharge_detail(client, hosts_map, "mobile_game", d7, auth_headers),
+                ],
+                self.settings.max_concurrency,
+            )
 
         night_0 = web_0 + xm_0
         night_7 = web_7 + xm_7
@@ -1020,7 +1058,7 @@ class ExtraMetricsService:
             client.cookies.update(cookies)
 
     def _date_offset(self, query_date: date) -> int:
-        now_local = datetime.now(ZoneInfo(self.settings.timezone)).date()
+        now_local = datetime.now(get_tzinfo(self.settings.timezone)).date()
         return (query_date - now_local).days
 
     def _query_id(self) -> str:
@@ -1034,6 +1072,24 @@ class ExtraMetricsService:
                 if isinstance(k, str) and isinstance(v, str):
                     out[k] = v
         return out
+
+    def _normalize_ratio_text(self, raw_value: Any) -> str:
+        raw = str(raw_value or "").strip().replace("％", "%")
+        if not raw:
+            return ""
+        if raw.upper() == "N/A":
+            return "N/A"
+        if raw.endswith("%"):
+            numeric = raw[:-1].replace(",", "").strip()
+            try:
+                value = float(numeric)
+            except ValueError:
+                return raw
+            if abs(value) < 0.005:
+                value = 0.0
+            prefix = "+" if value > 0 else ""
+            return f"{prefix}{value:.2f}%"
+        return raw
 
     def _to_int(self, value: Any) -> int:
         if isinstance(value, int):

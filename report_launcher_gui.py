@@ -4,11 +4,12 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import webbrowser
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional
 from urllib.parse import urlparse
@@ -17,7 +18,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import yaml
-from auth_recovery_playwright import RecoverySettings, recover_auth
+from app_paths import ensure_first_run_config, migrate_legacy_runtime_files, resolve_app_paths
+from auth_repair import classify_auth_failure
 from browser_auth_refresh import BrowserRefreshSettings, refresh_extra_auth_from_browser
 from fenxi_auth_from_har import refresh_fenxi_auth_from_hars
 from pc_auth_from_har import refresh_pc_auth_from_hars
@@ -30,16 +32,20 @@ FEISHU_PC_URL_RE = re.compile(r"Feishu PC doc published:\s*(https?://\S+)")
 
 class ReportLauncherApp:
     LAUNCHD_LABEL = "com.starfish.autodatareport.daily"
+    APP_VERSION = "1.2"
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("云游戏日报控制台")
-        self.root.geometry("1100x760")
-        self.root.minsize(980, 700)
+        self.root.title(f"云游戏日报 · 一键工作台 V{self.APP_VERSION}")
+        self.root.geometry("1120x720")
+        self.root.minsize(980, 660)
 
         self.bundle_root = self._resolve_bundle_root()
-        self.project_root = self._resolve_runtime_root()
-        self.config_path = self._resolve_runtime_file("config.yaml")
+        self.app_paths = resolve_app_paths()
+        migrate_legacy_runtime_files(self.app_paths)
+        ensure_first_run_config(self.app_paths)
+        self.project_root = self.app_paths.data
+        self.config_path = self.app_paths.config
         self.script_path = self.bundle_root / "generate_daily_report.py"
         self.cli_exe_path = self.bundle_root / "autodatareport-cli.exe"
         self.browser_auth_script = self.bundle_root / "browser_auth_refresh.py"
@@ -53,28 +59,51 @@ class ReportLauncherApp:
         self.aux_running = False
         self.queue: "queue.Queue[tuple[str, str | int]]" = queue.Queue()
 
-        self.date_mode = tk.StringVar(value="today")
-        self.date_value = tk.StringVar(value=date.today().isoformat())
+        self.date_mode = tk.StringVar(value="yesterday")
+        self.date_value = tk.StringVar(value=(date.today() - timedelta(days=1)).isoformat())
         self.with_extra = tk.BooleanVar(value=True)
         self.verify_feishu = tk.BooleanVar(value=False)
         self.disable_feishu = tk.BooleanVar(value=False)
         self.auto_auth_recover = tk.BooleanVar(value=True)
 
-        self.status_text = tk.StringVar(value="待命")
+        self.status_text = tk.StringVar(value="准备就绪")
         self.progress_value = tk.IntVar(value=0)
         self.progress_pct_text = tk.StringVar(value="0%")
+        self.run_button_text = tk.StringVar(value="生成并发送昨天日报")
+        self.result_text = tk.StringVar(value="任务完成后，可在这里直接打开日报和输出文件。")
+        self.details_button_text = tk.StringVar(value="展开详细日志")
         self.feishu_url_main = tk.StringVar(value="")
         self.feishu_url_pc = tk.StringVar(value="")
         self.log_history: list[str] = []
+        self.details_visible = False
         self.has_auto_retried = False
+        self.has_870_cookie_retried = False
 
         self.schedule_hour = tk.StringVar(value="09")
-        self.schedule_minute = tk.StringVar(value="10")
+        self.schedule_minute = tk.StringVar(value="00")
         self.schedule_status = tk.StringVar(value="定时任务：未检测")
+        self.tools_menubutton: Optional[ttk.Menubutton] = None
+        self.schedule_menu: Optional[tk.Menu] = None
+        self.document_menu: Optional[tk.Menu] = None
+        self.schedule_time_menu_index: Optional[int] = None
+        self.schedule_status_menu_index: Optional[int] = None
+        self.feishu_main_menu_index: Optional[int] = None
+        self.feishu_pc_menu_index: Optional[int] = None
+        self.option_summary_text = tk.StringVar(value="")
+        self.status_badge: Optional[ttk.Label] = None
+        self.log_card: Optional[ttk.Frame] = None
+        self.btn_main_doc: Optional[ttk.Button] = None
+        self.btn_pc_doc: Optional[ttk.Button] = None
 
         self._configure_style()
+        for option_var in (self.with_extra, self.verify_feishu, self.disable_feishu, self.auto_auth_recover):
+            option_var.trace_add("write", lambda *_args: self._update_option_summary())
+        self.date_value.trace_add("write", lambda *_args: self._update_option_summary())
         self._build_ui()
+        self._update_option_summary()
         self._refresh_schedule_status()
+        self.root.bind("<Control-Return>", lambda _event: self.start_run())
+        self.root.bind("<Escape>", lambda _event: self.stop_run())
         self.root.after(120, self._drain_queue)
 
     def _resolve_bundle_root(self) -> Path:
@@ -85,9 +114,12 @@ class ReportLauncherApp:
     def _resolve_python_bin(self) -> str:
         if getattr(sys, "frozen", False):
             return ""
-        venv_bin = self.project_root / ".venv" / "bin" / "python"
-        if venv_bin.exists():
-            return str(venv_bin)
+        for venv_bin in (
+            self.bundle_root / ".venv" / "Scripts" / "python.exe",
+            self.bundle_root / ".venv" / "bin" / "python",
+        ):
+            if venv_bin.exists():
+                return str(venv_bin)
         return "python3"
 
     def _resolve_runtime_root(self) -> Path:
@@ -105,192 +137,305 @@ class ReportLauncherApp:
         return runtime_path
 
     def _extra_auth_path(self) -> Path:
-        return self.project_root / "extra_auth.json"
+        return self.app_paths.extra_auth
 
     def _build_cli_command(self, *args: str) -> list[str]:
         if getattr(sys, "frozen", False):
             if not self.cli_exe_path.exists():
                 raise FileNotFoundError(f"未找到打包后的 CLI：{self.cli_exe_path}")
-            return [str(self.cli_exe_path), *args]
-        return [self.python_bin, str(self.script_path), *args]
+            base = [str(self.cli_exe_path)]
+        else:
+            base = [self.python_bin, str(self.script_path)]
+        return [*base, "--data-dir", str(self.project_root), *args]
+
+    def _append_auth_repair_args(self, cmd: list[str], *, target: str = "auto") -> None:
+        if not self.auto_auth_recover.get():
+            return
+        cmd.extend(
+            [
+                "--repair-auth-on-failure",
+                "--auth-repair-browser",
+                "chrome",
+                "--auth-repair-profile",
+                str(self.project_root / "output" / "auth_profiles" / "chrome_daily_report"),
+                "--auth-repair-timeout-seconds",
+                "300",
+                "--auth-repair-target",
+                target,
+            ]
+        )
 
     def _configure_style(self) -> None:
-        self.root.configure(bg="#E8EEF3")
+        self.font_family = "Microsoft YaHei UI" if os.name == "nt" else "PingFang SC"
+        self.mono_font = "Consolas" if os.name == "nt" else "Menlo"
+        self.root.configure(bg="#F3F6FA")
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
 
-        style.configure("Root.TFrame", background="#E8EEF3")
-        style.configure("Card.TFrame", background="#F6FAFD")
-        style.configure("CardTitle.TLabel", background="#F6FAFD", foreground="#213547", font=("PingFang SC", 11, "bold"))
-        style.configure("Muted.TLabel", background="#F6FAFD", foreground="#5D6C7A", font=("PingFang SC", 10))
-        style.configure("Body.TLabel", background="#F6FAFD", foreground="#22313F", font=("PingFang SC", 10))
-        style.configure("HeaderTitle.TLabel", background="#DDEAF5", foreground="#102A43", font=("PingFang SC", 17, "bold"))
-        style.configure("HeaderSub.TLabel", background="#DDEAF5", foreground="#334E68", font=("PingFang SC", 10))
+        style.configure("Root.TFrame", background="#F3F6FA")
+        style.configure("Header.TFrame", background="#0F172A")
+        style.configure("Card.TFrame", background="#FFFFFF")
+        style.configure("Hero.TFrame", background="#FFFFFF")
+        style.configure("Subtle.TFrame", background="#F8FAFC")
+        style.configure("CardTitle.TLabel", background="#FFFFFF", foreground="#0F172A", font=(self.font_family, 11, "bold"))
+        style.configure("SectionTitle.TLabel", background="#FFFFFF", foreground="#0F172A", font=(self.font_family, 13, "bold"))
+        style.configure("Muted.TLabel", background="#FFFFFF", foreground="#64748B", font=(self.font_family, 9))
+        style.configure("Body.TLabel", background="#FFFFFF", foreground="#334155", font=(self.font_family, 10))
+        style.configure("Strong.TLabel", background="#FFFFFF", foreground="#0F172A", font=(self.font_family, 11, "bold"))
+        style.configure("HeaderEyebrow.TLabel", background="#0F172A", foreground="#60A5FA", font=(self.font_family, 9, "bold"))
+        style.configure("HeaderTitle.TLabel", background="#0F172A", foreground="#F8FAFC", font=(self.font_family, 20, "bold"))
+        style.configure("HeaderSub.TLabel", background="#0F172A", foreground="#CBD5E1", font=(self.font_family, 10))
+        style.configure("HeaderMeta.TLabel", background="#0F172A", foreground="#94A3B8", font=(self.font_family, 8))
+        style.configure("StatusPill.TLabel", background="#1E293B", foreground="#E2E8F0", font=(self.font_family, 9, "bold"), padding=(12, 6))
+        style.configure("Running.StatusPill.TLabel", background="#1D4ED8", foreground="#EFF6FF", font=(self.font_family, 9, "bold"), padding=(12, 6))
+        style.configure("Success.StatusPill.TLabel", background="#047857", foreground="#ECFDF5", font=(self.font_family, 9, "bold"), padding=(12, 6))
+        style.configure("Error.StatusPill.TLabel", background="#B45309", foreground="#FFF7ED", font=(self.font_family, 9, "bold"), padding=(12, 6))
+        style.configure("OptionSummary.TLabel", background="#EFF6FF", foreground="#1D4ED8", font=(self.font_family, 9, "bold"), padding=(10, 5))
+        style.configure("ResultSummary.TLabel", background="#F8FAFC", foreground="#334155", font=(self.font_family, 10), padding=(12, 9))
+        style.configure("Date.TRadiobutton", background="#FFFFFF", foreground="#334155", font=(self.font_family, 10), padding=(6, 3))
+        style.map("Date.TRadiobutton", background=[("active", "#FFFFFF")], foreground=[("selected", "#1D4ED8")])
 
-        style.configure("Primary.TButton", font=("PingFang SC", 10, "bold"), padding=(12, 7))
-        style.map("Primary.TButton", background=[("!disabled", "#1F7AE0")], foreground=[("!disabled", "#FFFFFF")])
+        style.configure("Hero.TButton", font=(self.font_family, 13, "bold"), padding=(26, 16), borderwidth=0)
+        style.map(
+            "Hero.TButton",
+            background=[("disabled", "#94A3B8"), ("pressed", "#1E40AF"), ("active", "#3B82F6"), ("!disabled", "#2563EB")],
+            foreground=[("disabled", "#E2E8F0"), ("!disabled", "#FFFFFF")],
+        )
 
-        style.configure("Warn.TButton", font=("PingFang SC", 10), padding=(12, 7))
-        style.map("Warn.TButton", background=[("!disabled", "#FFF1E8")], foreground=[("!disabled", "#B54708")])
+        style.configure("Primary.TButton", font=(self.font_family, 10, "bold"), padding=(14, 9), borderwidth=0)
+        style.map(
+            "Primary.TButton",
+            background=[("disabled", "#CBD5E1"), ("pressed", "#1E40AF"), ("active", "#3B82F6"), ("!disabled", "#2563EB")],
+            foreground=[("disabled", "#64748B"), ("!disabled", "#FFFFFF")],
+        )
 
-        style.configure("Ghost.TButton", font=("PingFang SC", 10), padding=(10, 6))
-        style.map("Ghost.TButton", background=[("!disabled", "#EDF3F8")], foreground=[("!disabled", "#2F4858")])
+        style.configure("Warn.TButton", font=(self.font_family, 10), padding=(12, 9), borderwidth=0)
+        style.map(
+            "Warn.TButton",
+            background=[("disabled", "#F1F5F9"), ("pressed", "#FED7AA"), ("active", "#FFEDD5"), ("!disabled", "#FFF7ED")],
+            foreground=[("disabled", "#94A3B8"), ("!disabled", "#C2410C")],
+        )
 
-        style.configure("Run.Horizontal.TProgressbar", troughcolor="#D9E2EC", background="#1F7AE0", bordercolor="#D9E2EC", lightcolor="#1F7AE0", darkcolor="#1F7AE0")
+        style.configure("Ghost.TButton", font=(self.font_family, 9), padding=(11, 8), borderwidth=1)
+        style.map(
+            "Ghost.TButton",
+            background=[("disabled", "#F8FAFC"), ("pressed", "#E2E8F0"), ("active", "#F1F5F9"), ("!disabled", "#FFFFFF")],
+            foreground=[("disabled", "#94A3B8"), ("!disabled", "#334155")],
+        )
+        style.configure("Header.TMenubutton", font=(self.font_family, 9, "bold"), padding=(11, 7), borderwidth=0)
+        style.map(
+            "Header.TMenubutton",
+            background=[("pressed", "#334155"), ("active", "#334155"), ("!disabled", "#1E293B")],
+            foreground=[("!disabled", "#E2E8F0")],
+        )
+
+        style.configure("Run.Horizontal.TProgressbar", troughcolor="#E2E8F0", background="#2563EB", bordercolor="#E2E8F0", lightcolor="#2563EB", darkcolor="#2563EB", thickness=9)
 
     def _build_ui(self) -> None:
-        container = ttk.Frame(self.root, style="Root.TFrame", padding=14)
+        container = ttk.Frame(self.root, style="Root.TFrame", padding=18)
         container.pack(fill=tk.BOTH, expand=True)
 
-        header = ttk.Frame(container, style="Card.TFrame", padding=(16, 12))
+        header = ttk.Frame(container, style="Header.TFrame", padding=(20, 16))
         header.pack(fill=tk.X)
-        ttk.Label(header, text="云游戏日报控制台", style="HeaderTitle.TLabel").pack(anchor="w")
-        ttk.Label(
-            header,
-            text="一键登录跳转、立即执行、进度跟踪、定时任务管理（飞书默认推送）",
-            style="HeaderSub.TLabel",
-        ).pack(anchor="w", pady=(4, 0))
+        self._build_header(header)
 
-        top_grid = ttk.Frame(container, style="Root.TFrame")
-        top_grid.pack(fill=tk.X, pady=(10, 0))
-        top_grid.columnconfigure(0, weight=1)
-        top_grid.columnconfigure(1, weight=1)
-
-        run_card = ttk.Frame(top_grid, style="Card.TFrame", padding=12)
-        run_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        run_card = ttk.Frame(container, style="Hero.TFrame", padding=(20, 18))
+        run_card.pack(fill=tk.X, pady=(12, 0))
         self._build_run_controls(run_card)
 
-        schedule_card = ttk.Frame(top_grid, style="Card.TFrame", padding=12)
-        schedule_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        self._build_schedule_controls(schedule_card)
-
-        action_card = ttk.Frame(container, style="Card.TFrame", padding=12)
-        action_card.pack(fill=tk.X, pady=(10, 0))
-        self._build_action_controls(action_card)
-
-        progress_card = ttk.Frame(container, style="Card.TFrame", padding=12)
+        progress_card = ttk.Frame(container, style="Card.TFrame", padding=(18, 14))
         progress_card.pack(fill=tk.X, pady=(10, 0))
         self._build_progress(progress_card)
 
-        log_card = ttk.Frame(container, style="Card.TFrame", padding=12)
-        log_card.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
-        self._build_logs(log_card)
+        result_card = ttk.Frame(container, style="Card.TFrame", padding=(18, 14))
+        result_card.pack(fill=tk.X, pady=(10, 0))
+        self._build_results(result_card)
+
+        details_bar = ttk.Frame(container, style="Root.TFrame")
+        details_bar.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(
+            details_bar,
+            text="详细日志只在排查问题时需要",
+            background="#F3F6FA",
+            foreground="#64748B",
+            font=(self.font_family, 9),
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            details_bar,
+            textvariable=self.details_button_text,
+            style="Ghost.TButton",
+            command=self._toggle_logs,
+            cursor="hand2",
+        ).pack(side=tk.RIGHT)
+
+        self.log_card = ttk.Frame(container, style="Card.TFrame", padding=12)
+        self._build_logs(self.log_card)
+
+    def _build_header(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=0)
+
+        title_area = ttk.Frame(parent, style="Header.TFrame")
+        title_area.grid(row=0, column=0, sticky="w")
+        ttk.Label(title_area, text=f"AUTODATAREPORT · V{self.APP_VERSION}", style="HeaderEyebrow.TLabel").pack(anchor="w")
+        ttk.Label(title_area, text="云游戏日报 · 一键工作台", style="HeaderTitle.TLabel").pack(anchor="w", pady=(3, 0))
+        ttk.Label(
+            title_area,
+            text="默认生成并发送昨天日报；登录失效时会直接告诉你下一步。",
+            style="HeaderSub.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Label(
+            title_area,
+            text=f"运行数据：{self.project_root}",
+            style="HeaderMeta.TLabel",
+        ).pack(anchor="w", pady=(6, 0))
+
+        command_area = ttk.Frame(parent, style="Header.TFrame")
+        command_area.grid(row=0, column=1, sticky="e")
+        self.tools_menubutton = ttk.Menubutton(
+            command_area,
+            text="设置与修复  ▾",
+            style="Header.TMenubutton",
+            cursor="hand2",
+        )
+        self.tools_menubutton.pack(side=tk.LEFT, padx=(0, 10))
+        self._build_tools_menu()
+        self.status_badge = ttk.Label(command_area, textvariable=self.status_text, style="StatusPill.TLabel")
+        self.status_badge.pack(side=tk.LEFT)
 
     def _build_run_controls(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="运行参数", style="CardTitle.TLabel").grid(row=0, column=0, columnspan=6, sticky="w")
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=0)
 
-        ttk.Label(parent, text="日期模式", style="Body.TLabel").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        ttk.Radiobutton(parent, text="今天", value="today", variable=self.date_mode, command=self._update_date_from_mode).grid(
-            row=1, column=1, sticky="w", padx=(8, 0), pady=(10, 0)
-        )
-        ttk.Radiobutton(parent, text="昨天", value="yesterday", variable=self.date_mode, command=self._update_date_from_mode).grid(
-            row=1, column=2, sticky="w", padx=(6, 0), pady=(10, 0)
-        )
-
-        ttk.Label(parent, text="执行日期", style="Body.TLabel").grid(row=1, column=3, sticky="e", padx=(16, 6), pady=(10, 0))
-        ttk.Entry(parent, textvariable=self.date_value, width=14).grid(row=1, column=4, sticky="w", pady=(10, 0))
-
-        ttk.Checkbutton(parent, text="抓取扩展数据（分析后台+505）", variable=self.with_extra).grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(10, 0)
-        )
-        ttk.Checkbutton(parent, text="推送后校验飞书内容", variable=self.verify_feishu).grid(
-            row=2, column=3, columnspan=2, sticky="w", pady=(10, 0)
-        )
-        ttk.Checkbutton(parent, text="本次禁用飞书推送", variable=self.disable_feishu).grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(6, 0)
-        )
-        ttk.Checkbutton(parent, text="登录态失败时自动修复并重试一次", variable=self.auto_auth_recover).grid(
-            row=3, column=3, columnspan=3, sticky="w", pady=(6, 0)
-        )
-
+        setup_area = ttk.Frame(parent, style="Hero.TFrame")
+        setup_area.grid(row=0, column=0, sticky="nsew", padx=(0, 24))
+        ttk.Label(setup_area, text="今天要做什么？", style="SectionTitle.TLabel").pack(anchor="w")
         ttk.Label(
-            parent,
-            text="提示：定时任务会读取 .env.scheduler 里的飞书凭证。",
+            setup_area,
+            text="默认已经选好昨天。直接点右侧按钮即可生成并发送。",
             style="Muted.TLabel",
-        ).grid(row=4, column=0, columnspan=6, sticky="w", pady=(10, 0))
+        ).pack(anchor="w", pady=(4, 0))
 
-    def _build_schedule_controls(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="定时任务", style="CardTitle.TLabel").grid(row=0, column=0, columnspan=6, sticky="w")
+        date_row = ttk.Frame(setup_area, style="Hero.TFrame")
+        date_row.pack(anchor="w", pady=(14, 0))
+        ttk.Label(date_row, text="日报日期", style="Strong.TLabel").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(
+            date_row,
+            text="昨天",
+            value="yesterday",
+            variable=self.date_mode,
+            command=self._update_date_from_mode,
+            style="Date.TRadiobutton",
+        ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            date_row,
+            text="今天",
+            value="today",
+            variable=self.date_mode,
+            command=self._update_date_from_mode,
+            style="Date.TRadiobutton",
+        ).pack(side=tk.LEFT, padx=(4, 0))
+        self.date_entry = ttk.Entry(date_row, textvariable=self.date_value, width=13, font=(self.font_family, 10))
+        self.date_entry.pack(side=tk.LEFT, padx=(10, 0), ipady=3)
+        self.date_entry.bind("<KeyRelease>", lambda _event: self.date_mode.set("custom"))
 
-        ttk.Label(parent, text="每天执行时间", style="Body.TLabel").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        ttk.Spinbox(parent, from_=0, to=23, width=4, textvariable=self.schedule_hour, format="%02.0f").grid(
-            row=1, column=1, sticky="w", pady=(10, 0)
+        summary_row = ttk.Frame(setup_area, style="Hero.TFrame")
+        summary_row.pack(anchor="w", pady=(14, 0))
+        ttk.Label(summary_row, textvariable=self.option_summary_text, style="OptionSummary.TLabel").pack(side=tk.LEFT)
+        ttk.Label(
+            summary_row,
+            text="可在右上角“设置与修复”里调整",
+            style="Muted.TLabel",
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        action_area = ttk.Frame(parent, style="Hero.TFrame")
+        action_area.grid(row=0, column=1, sticky="e")
+        self.btn_start = ttk.Button(
+            action_area,
+            textvariable=self.run_button_text,
+            style="Hero.TButton",
+            command=self.start_run,
+            cursor="hand2",
         )
-        ttk.Label(parent, text=":", style="Body.TLabel").grid(row=1, column=2, sticky="w", pady=(10, 0))
-        ttk.Spinbox(parent, from_=0, to=59, width=4, textvariable=self.schedule_minute, format="%02.0f").grid(
-            row=1, column=3, sticky="w", pady=(10, 0)
+        self.btn_start.pack(fill=tk.X)
+        self.btn_stop = ttk.Button(
+            action_area,
+            text="停止当前任务",
+            style="Warn.TButton",
+            command=self.stop_run,
+            state=tk.DISABLED,
+            cursor="hand2",
         )
+        self.btn_stop.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(
+            action_area,
+            text="Ctrl + Enter 可直接开始",
+            style="Muted.TLabel",
+        ).pack(anchor="center", pady=(7, 0))
 
-        ttk.Button(parent, text="安装/更新定时任务", style="Primary.TButton", command=self.install_schedule).grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(12, 0)
-        )
-        ttk.Button(parent, text="立即触发定时任务", style="Ghost.TButton", command=self.trigger_schedule_now).grid(
-            row=2, column=2, columnspan=2, sticky="w", padx=(8, 0), pady=(12, 0)
-        )
+    def _build_tools_menu(self) -> None:
+        if self.tools_menubutton is None:
+            return
+        tools_menu = tk.Menu(self.tools_menubutton, tearoff=False)
+        self.tools_menubutton.configure(menu=tools_menu)
 
-        ttk.Button(parent, text="取消定时任务", style="Warn.TButton", command=self.disable_schedule).grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(8, 0)
-        )
-        ttk.Button(parent, text="刷新状态", style="Ghost.TButton", command=self._refresh_schedule_status).grid(
-            row=3, column=2, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 0)
-        )
+        auth_menu = tk.Menu(tools_menu, tearoff=False)
+        auth_menu.add_command(label="打开 870 登录页", command=self.open_870_login)
+        auth_menu.add_command(label="更新 870 登录态", command=self.open_870_cookie_repair_dialog)
+        auth_menu.add_separator()
+        auth_menu.add_command(label="自动刷新 PC 登录态", command=self.refresh_pc_auth)
+        auth_menu.add_command(label="从 HAR 更新 PC 登录态", command=self.import_pc_har)
+        auth_menu.add_command(label="从 HAR 更新 Fenxi 登录态", command=self.import_fenxi_har)
+        tools_menu.add_cascade(label="登录态修复", menu=auth_menu)
 
-        ttk.Label(parent, textvariable=self.schedule_status, style="Muted.TLabel").grid(
-            row=4, column=0, columnspan=6, sticky="w", pady=(10, 0)
-        )
+        run_menu = tk.Menu(tools_menu, tearoff=False)
+        run_menu.add_checkbutton(label="抓取完整数据（分析后台 + 505）", variable=self.with_extra)
+        run_menu.add_checkbutton(label="发送后校验飞书内容", variable=self.verify_feishu)
+        run_menu.add_checkbutton(label="本次仅生成，不发送", variable=self.disable_feishu)
+        run_menu.add_checkbutton(label="登录失效时自动修复并重试", variable=self.auto_auth_recover)
+        tools_menu.add_cascade(label="本次运行选项", menu=run_menu)
 
-    def _build_action_controls(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="快捷操作", style="CardTitle.TLabel").pack(anchor="w")
+        if self._ensure_macos_silent():
+            self.schedule_menu = tk.Menu(tools_menu, tearoff=False)
+            self.schedule_menu.add_command(label="", command=self.edit_schedule_time)
+            self.schedule_time_menu_index = 0
+            self.schedule_menu.add_command(label="安装/更新定时任务", command=self.install_schedule)
+            self.schedule_menu.add_command(label="立即触发定时任务", command=self.trigger_schedule_now)
+            self.schedule_menu.add_command(label="取消定时任务", command=self.disable_schedule)
+            self.schedule_menu.add_command(label="刷新状态", command=self._refresh_schedule_status)
+            self.schedule_menu.add_separator()
+            self.schedule_menu.add_command(label=self.schedule_status.get(), state=tk.DISABLED)
+            self.schedule_status_menu_index = 6
+            tools_menu.add_cascade(label="定时任务", menu=self.schedule_menu)
 
-        bar = ttk.Frame(parent, style="Card.TFrame")
-        bar.pack(fill=tk.X, pady=(10, 0))
+        self.document_menu = tk.Menu(tools_menu, tearoff=False)
+        self.document_menu.add_command(label="打开主日报飞书文档", command=self.open_main_feishu, state=tk.DISABLED)
+        self.feishu_main_menu_index = 0
+        self.document_menu.add_command(label="打开 PC 飞书文档", command=self.open_pc_feishu, state=tk.DISABLED)
+        self.feishu_pc_menu_index = 1
+        self.document_menu.add_separator()
+        self.document_menu.add_command(label="打开输出文件夹", command=self.open_output_dir)
+        self.document_menu.add_command(label="打开定时日志文件夹", command=self.open_log_dir)
+        tools_menu.add_cascade(label="结果与文件", menu=self.document_menu)
 
-        self.btn_open_login = ttk.Button(bar, text="打开870登录页", style="Ghost.TButton", command=self.open_870_login)
-        self.btn_open_login.pack(side=tk.LEFT)
-
-        self.btn_start = ttk.Button(bar, text="立即启动任务", style="Primary.TButton", command=self.start_run)
-        self.btn_start.pack(side=tk.LEFT, padx=(10, 0))
-
-        self.btn_stop = ttk.Button(bar, text="停止任务", style="Warn.TButton", command=self.stop_run, state=tk.DISABLED)
-        self.btn_stop.pack(side=tk.LEFT, padx=(10, 0))
-
-        self.btn_open_feishu_main = ttk.Button(
-            bar, text="打开日报飞书文档", style="Ghost.TButton", command=self.open_main_feishu, state=tk.DISABLED
-        )
-        self.btn_open_feishu_main.pack(side=tk.LEFT, padx=(10, 0))
-
-        self.btn_open_feishu_pc = ttk.Button(
-            bar, text="打开PC飞书文档", style="Ghost.TButton", command=self.open_pc_feishu, state=tk.DISABLED
-        )
-        self.btn_open_feishu_pc.pack(side=tk.LEFT, padx=(10, 0))
-
-        ttk.Button(bar, text="打开日志目录", style="Ghost.TButton", command=self.open_log_dir).pack(side=tk.LEFT, padx=(10, 0))
-
-        push_bar = ttk.Frame(parent, style="Card.TFrame")
-        push_bar.pack(fill=tk.X, pady=(10, 0))
-        ttk.Button(push_bar, text="补推主日报飞书", style="Ghost.TButton", command=self.repush_main_feishu).pack(side=tk.LEFT)
-        ttk.Button(push_bar, text="补推PC日报飞书", style="Ghost.TButton", command=self.repush_pc_feishu).pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Button(push_bar, text="推企业微信-单人", style="Ghost.TButton", command=self.push_wecom_single).pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Button(push_bar, text="推企业微信-群", style="Ghost.TButton", command=self.push_wecom_group).pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Label(push_bar, text="仅推送已有 output 下的 txt 到飞书，不重跑数据", style="Muted.TLabel").pack(side=tk.LEFT, padx=(12, 0))
-
-        auth_bar = ttk.Frame(parent, style="Card.TFrame")
-        auth_bar.pack(fill=tk.X, pady=(10, 0))
-        ttk.Button(auth_bar, text="自动刷新PC登录态", style="Ghost.TButton", command=self.refresh_pc_auth).pack(side=tk.LEFT)
-        ttk.Button(auth_bar, text="上传PC HAR并更新", style="Ghost.TButton", command=self.import_pc_har).pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Button(auth_bar, text="上传Fenxi HAR并更新", style="Ghost.TButton", command=self.import_fenxi_har).pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Label(auth_bar, text="登录态维护：PC自动刷新/PC HAR导入/Fenxi HAR导入", style="Muted.TLabel").pack(side=tk.LEFT, padx=(12, 0))
+        push_menu = tk.Menu(tools_menu, tearoff=False)
+        push_menu.add_command(label="重新发送主日报到飞书", command=self.repush_main_feishu)
+        push_menu.add_command(label="重新发送 PC 日报到飞书", command=self.repush_pc_feishu)
+        push_menu.add_command(label="发送到企业微信个人", command=self.push_wecom_single)
+        push_menu.add_command(label="发送到企业微信群", command=self.push_wecom_group)
+        tools_menu.add_cascade(label="手动补发", menu=push_menu)
+        self._update_schedule_menu_labels()
 
     def _build_progress(self, parent: ttk.Frame) -> None:
         title_row = ttk.Frame(parent, style="Card.TFrame")
         title_row.pack(fill=tk.X)
-        ttk.Label(title_row, text="任务进度", style="CardTitle.TLabel").pack(side=tk.LEFT)
-        ttk.Label(title_row, textvariable=self.progress_pct_text, style="Body.TLabel").pack(side=tk.RIGHT)
+        ttk.Label(title_row, text="执行进度", style="CardTitle.TLabel").pack(side=tk.LEFT)
+        ttk.Label(title_row, textvariable=self.progress_pct_text, style="Strong.TLabel").pack(side=tk.RIGHT)
 
-        ttk.Label(parent, textvariable=self.status_text, style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
+        ttk.Label(parent, textvariable=self.status_text, style="Body.TLabel").pack(anchor="w", pady=(7, 0))
 
         self.progress = ttk.Progressbar(
             parent,
@@ -300,23 +445,67 @@ class ReportLauncherApp:
             maximum=100,
             style="Run.Horizontal.TProgressbar",
         )
-        self.progress.pack(fill=tk.X, pady=(8, 0))
+        self.progress.pack(fill=tk.X, pady=(9, 0))
+
+    def _build_results(self, parent: ttk.Frame) -> None:
+        header = ttk.Frame(parent, style="Card.TFrame")
+        header.pack(fill=tk.X)
+        ttk.Label(header, text="完成后", style="CardTitle.TLabel").pack(side=tk.LEFT)
+        ttk.Label(header, text="不用再去文件夹里找", style="Muted.TLabel").pack(side=tk.LEFT, padx=(10, 0))
+
+        ttk.Label(parent, textvariable=self.result_text, style="ResultSummary.TLabel").pack(fill=tk.X, pady=(9, 0))
+
+        actions = ttk.Frame(parent, style="Card.TFrame")
+        actions.pack(fill=tk.X, pady=(9, 0))
+        self.btn_main_doc = ttk.Button(
+            actions,
+            text="打开主日报",
+            style="Primary.TButton",
+            command=self.open_main_feishu,
+            state=tk.DISABLED,
+            cursor="hand2",
+        )
+        self.btn_main_doc.pack(side=tk.LEFT)
+        self.btn_pc_doc = ttk.Button(
+            actions,
+            text="打开 PC 日报",
+            style="Ghost.TButton",
+            command=self.open_pc_feishu,
+            state=tk.DISABLED,
+            cursor="hand2",
+        )
+        self.btn_pc_doc.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            actions,
+            text="打开输出文件夹",
+            style="Ghost.TButton",
+            command=self.open_output_dir,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            actions,
+            text="登录失效？更新 870 登录态",
+            style="Ghost.TButton",
+            command=self.open_870_cookie_repair_dialog,
+            cursor="hand2",
+        ).pack(side=tk.RIGHT)
 
     def _build_logs(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="运行日志", style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(parent, text="详细运行日志", style="CardTitle.TLabel").pack(anchor="w")
         wrapper = ttk.Frame(parent, style="Card.TFrame")
         wrapper.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
         self.log_text = tk.Text(
             wrapper,
             wrap="word",
-            height=24,
-            bg="#0E1A26",
-            fg="#D5E1ED",
-            insertbackground="#D5E1ED",
+            height=13,
+            bg="#0F172A",
+            fg="#CBD5E1",
+            insertbackground="#CBD5E1",
+            selectbackground="#1D4ED8",
             relief="flat",
-            font=("Menlo", 11),
-            padx=10,
+            font=(self.mono_font, 10),
+            padx=12,
             pady=10,
         )
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -326,12 +515,32 @@ class ReportLauncherApp:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text.configure(yscrollcommand=scrollbar.set)
 
+    def _toggle_logs(self, force: Optional[bool] = None) -> None:
+        if self.log_card is None:
+            return
+        should_show = (not self.details_visible) if force is None else bool(force)
+        if should_show == self.details_visible:
+            return
+        self.details_visible = should_show
+        if should_show:
+            self.log_card.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+            self.details_button_text.set("收起详细日志")
+            target_height = min(900, self.root.winfo_screenheight() - 80)
+            if self.root.winfo_height() < target_height:
+                self.root.geometry(f"{max(self.root.winfo_width(), 980)}x{target_height}")
+        else:
+            self.log_card.pack_forget()
+            self.details_button_text.set("展开详细日志")
+            if self.root.winfo_height() > 720:
+                self.root.geometry(f"{max(self.root.winfo_width(), 980)}x720")
+
     def _update_date_from_mode(self) -> None:
         if self.date_mode.get() == "yesterday":
             target = date.today() - timedelta(days=1)
         else:
             target = date.today()
         self.date_value.set(target.isoformat())
+        self._update_option_summary()
 
     def _append_log(self, line: str) -> None:
         self.log_history.append(str(line))
@@ -358,20 +567,83 @@ class ReportLauncherApp:
         return env
 
     def _build_command(self) -> list[str]:
+        extra_auth_file = self._extra_auth_path()
         cmd = self._build_cli_command(
             "--config",
             str(self.config_path),
             "--date",
             self.date_value.get().strip(),
             "--no-runtime-gui",
+            "--extra-auth-file",
+            str(extra_auth_file),
         )
         if self.with_extra.get():
             cmd.append("--with-extra-metrics")
         if self.verify_feishu.get():
             cmd.append("--verify-feishu-content")
         if self.disable_feishu.get():
-            cmd.append("--no-push-feishu-doc")
+            cmd.append("--no-publish")
+        self._append_auth_repair_args(cmd, target="auto")
         return cmd
+
+    def _update_option_summary(self) -> None:
+        parts = ["完整数据" if self.with_extra.get() else "基础数据"]
+        parts.append("仅生成，不发送" if self.disable_feishu.get() else "自动发送飞书 / 企微")
+        if self.verify_feishu.get():
+            parts.append("发送后校验")
+        if self.auto_auth_recover.get():
+            parts.append("登录失效自动修复")
+        self.option_summary_text.set(" · ".join(parts))
+
+        value = self.date_value.get().strip()
+        if value == date.today().isoformat():
+            date_label = "今天"
+        elif value == (date.today() - timedelta(days=1)).isoformat():
+            date_label = "昨天"
+        else:
+            date_label = value or "所选日期"
+        action = "仅生成" if self.disable_feishu.get() else "生成并发送"
+        self.run_button_text.set(f"{action}{date_label}日报")
+
+    def _set_feishu_menu_state(self) -> None:
+        if self.document_menu is None:
+            return
+        if self.feishu_main_menu_index is not None:
+            state = tk.NORMAL if self.feishu_url_main.get().strip() else tk.DISABLED
+            self.document_menu.entryconfig(self.feishu_main_menu_index, state=state)
+            if self.btn_main_doc is not None:
+                self.btn_main_doc.configure(state=state)
+        if self.feishu_pc_menu_index is not None:
+            state = tk.NORMAL if self.feishu_url_pc.get().strip() else tk.DISABLED
+            self.document_menu.entryconfig(self.feishu_pc_menu_index, state=state)
+            if self.btn_pc_doc is not None:
+                self.btn_pc_doc.configure(state=state)
+
+    def _update_schedule_menu_labels(self) -> None:
+        if self.schedule_menu is None:
+            return
+        if self.schedule_time_menu_index is not None:
+            self.schedule_menu.entryconfig(
+                self.schedule_time_menu_index,
+                label=f"◷ 设置执行时间（当前 {self.schedule_hour.get().strip()}:{self.schedule_minute.get().strip()}）",
+            )
+        if self.schedule_status_menu_index is not None:
+            self.schedule_menu.entryconfig(self.schedule_status_menu_index, label=self.schedule_status.get())
+
+    def _set_schedule_status(self, status: str) -> None:
+        self.schedule_status.set(status)
+        self._update_schedule_menu_labels()
+
+    def _set_visual_state(self, state: str) -> None:
+        if self.status_badge is None:
+            return
+        styles = {
+            "idle": "StatusPill.TLabel",
+            "running": "Running.StatusPill.TLabel",
+            "success": "Success.StatusPill.TLabel",
+            "error": "Error.StatusPill.TLabel",
+        }
+        self.status_badge.configure(style=styles.get(state, "StatusPill.TLabel"))
 
     def _set_progress(self, value: int, status: Optional[str] = None) -> None:
         pct = max(0, min(100, int(value)))
@@ -381,50 +653,44 @@ class ReportLauncherApp:
             self.status_text.set(status)
 
     def start_run(self, from_auto_retry: bool = False) -> None:
-        if self.process is not None:
+        if self._is_busy():
+            if not from_auto_retry:
+                messagebox.showinfo("任务正在执行", "请等待当前任务结束后再开始。")
             return
         if not from_auto_retry:
             self.has_auto_retried = False
         self.log_history = []
         run_date = self.date_value.get().strip()
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", run_date):
-            messagebox.showerror("日期格式错误", "请输入 YYYY-MM-DD 格式日期。")
+        if not from_auto_retry:
+            self.has_870_cookie_retried = False
+        try:
+            datetime.strptime(run_date, "%Y-%m-%d")
+        except ValueError:
+            messagebox.showerror("日期格式不正确", "请按 YYYY-MM-DD 填写，例如 2026-07-16。")
+            self.date_entry.focus_set()
             return
         if not self.config_path.exists():
-            messagebox.showerror("配置缺失", f"未找到配置文件：{self.config_path}")
+            messagebox.showerror("缺少配置文件", f"未找到配置文件：\n{self.config_path}")
             return
 
         cmd = self._build_command()
-        preflight_cmd = self._build_cli_command(
-            "--config",
-            str(self.config_path),
-            "--date",
-            run_date,
-            "--no-runtime-gui",
-            "--check-extra-auth",
-        )
         env = os.environ.copy()
         env.update(self._load_scheduler_env())
 
-        self._set_progress(0, "登录态预检中")
+        self._set_progress(0, "正在准备任务")
+        self._set_visual_state("running")
+        self.result_text.set("任务进行中。完成后，日报链接和本地文件会出现在这里。")
         self.feishu_url_main.set("")
         self.feishu_url_pc.set("")
-        self.btn_open_feishu_main.configure(state=tk.DISABLED)
-        self.btn_open_feishu_pc.configure(state=tk.DISABLED)
+        self._set_feishu_menu_state()
         self._append_log("=" * 84)
-        self._append_log("预检命令: " + " ".join(preflight_cmd))
-        self._append_log("启动命令: " + " ".join(cmd))
+        self._append_log("Start command: " + " ".join(cmd))
 
         self.btn_start.configure(state=tk.DISABLED)
         self.btn_stop.configure(state=tk.NORMAL)
 
         def _worker() -> None:
             try:
-                rc = self._run_streaming_cmd(preflight_cmd, env, "全平台登录态预检")
-                if rc != 0:
-                    self.queue.put(("line", "[GUI] 全平台登录态预检失败，主流程已终止"))
-                    self.queue.put(("preflight_failed", rc))
-                    return
                 self.process = subprocess.Popen(
                     cmd,
                     cwd=str(self.project_root),
@@ -483,22 +749,22 @@ class ReportLauncherApp:
                 pc_url_match = FEISHU_PC_URL_RE.search(text)
                 if pc_url_match:
                     self.feishu_url_pc.set(pc_url_match.group(1).strip())
-                    self.btn_open_feishu_pc.configure(state=tk.NORMAL)
+                    self._set_feishu_menu_state()
                 else:
                     main_url_match = FEISHU_MAIN_URL_RE.search(text)
                     if main_url_match:
                         self.feishu_url_main.set(main_url_match.group(1).strip())
-                        self.btn_open_feishu_main.configure(state=tk.NORMAL)
+                        self._set_feishu_menu_state()
             elif kind == "progress":
                 self._set_progress(int(value))
             elif kind == "status":
                 self.status_text.set(str(value))
             elif kind == "feishu_main":
                 self.feishu_url_main.set(str(value))
-                self.btn_open_feishu_main.configure(state=tk.NORMAL)
+                self._set_feishu_menu_state()
             elif kind == "feishu_pc":
                 self.feishu_url_pc.set(str(value))
-                self.btn_open_feishu_pc.configure(state=tk.NORMAL)
+                self._set_feishu_menu_state()
             elif kind == "done":
                 rc = int(value)
                 self.process = None
@@ -506,8 +772,21 @@ class ReportLauncherApp:
                 self.btn_stop.configure(state=tk.DISABLED)
                 if rc == 0:
                     self._set_progress(100, "任务完成")
+                    self._set_visual_state("success")
+                    delivered = []
+                    if self.feishu_url_main.get().strip():
+                        delivered.append("主日报已发送")
+                    if self.feishu_url_pc.get().strip():
+                        delivered.append("PC 日报已发送")
+                    if delivered:
+                        self.result_text.set("任务完成：" + "，".join(delivered) + "。可直接打开查看。")
+                    else:
+                        self.result_text.set("任务完成：日报文件已生成，可在输出文件夹中查看。")
                     self._append_log("[GUI] 任务完成")
                 else:
+                    if (not self.has_870_cookie_retried) and self._looks_like_870_cookie_failure():
+                        if self.prompt_870_cookie_repair(retry_after_save=True):
+                            continue
                     if (
                         self.auto_auth_recover.get()
                         and (not self.has_auto_retried)
@@ -522,16 +801,11 @@ class ReportLauncherApp:
                             self.start_auth_recovery_and_retry()
                             continue
                     self.status_text.set("任务失败")
+                    self._set_visual_state("error")
+                    self.result_text.set("任务没有完成。请展开详细日志查看原因；若提示登录失效，可直接更新 870 登录态。")
+                    self._toggle_logs(force=True)
                     self._append_log(f"[GUI] 任务失败，退出码={rc}")
-                    messagebox.showerror("运行失败", "任务执行失败，请查看日志。")
-            elif kind == "preflight_failed":
-                rc = int(value)
-                self.process = None
-                self.btn_start.configure(state=tk.NORMAL)
-                self.btn_stop.configure(state=tk.DISABLED)
-                self.status_text.set("登录态预检失败")
-                self._append_log(f"[GUI] 登录态预检失败，退出码={rc}")
-                messagebox.showerror("预检失败", self._extract_preflight_failure_reason())
+                    messagebox.showerror("任务未完成", "详细日志已经展开。请按最后一条提示处理后重试。")
             elif kind == "aux_done":
                 rc, label = value  # type: ignore[misc]
                 self.aux_running = False
@@ -548,9 +822,12 @@ class ReportLauncherApp:
                 if ok:
                     self._append_log("[GUI] 自动登录修复完成，开始重试任务")
                     self.status_text.set("自动修复成功，任务重试中")
+                    self._set_visual_state("running")
                     self.start_run(from_auto_retry=True)
                 else:
                     self.status_text.set("自动修复失败")
+                    self._set_visual_state("error")
+                    self._toggle_logs(force=True)
                     self._append_log(f"[GUI] 自动修复失败: {reason}")
                     messagebox.showerror("自动修复失败", str(reason))
                 self._refresh_schedule_status()
@@ -647,104 +924,219 @@ class ReportLauncherApp:
         self._append_log("[GUI] 当前任务已停止，开始更新登录态")
         return True
 
-    def _run_streaming_cmd(self, cmd: list[str], env: Dict[str, str], label: str) -> int:
-        self.queue.put(("line", "=" * 84))
-        self.queue.put(("line", f"[GUI] {label}"))
-        self.queue.put(("line", "执行命令: " + " ".join(cmd)))
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(self.project_root),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            env=env,
-        )
-        assert proc.stdout is not None
-        for raw_line in proc.stdout:
-            self.queue.put(("line", raw_line.rstrip("\n")))
-        return int(proc.wait())
+    def _recent_failure_text(self) -> str:
+        haystack = "\n".join(self.log_history[-220:])
+        marker = "Failed to generate report:"
+        if marker in haystack:
+            return haystack.rsplit(marker, 1)[-1]
+        return haystack
 
-    def _looks_like_auth_failure(self) -> bool:
-        haystack = "\n".join(self.log_history[-220:]).lower()
-        patterns = [
+    def _looks_like_870_cookie_failure(self) -> bool:
+        haystack = self._recent_failure_text()
+        lowered = haystack.lower()
+        markers = [
+            "870 network mode",
+            "抓取870数据",
             "870登录态不可用",
             "870登录态预检失败",
-            "登录态不可用",
-            "请先登录",
+            "admin.buke999.com",
+            "session cookie may be invalid",
             "session_cookie",
-            "扩展登录态预检失败",
-            "pc网页端登录态预检失败",
-            "pc网页端接口失败 status=-100",
-            "pc网页端接口失败 status=-101",
-            "fenxi token 预检失败",
-            "e_token",
-            "返回登录页",
+            "response is not valid json",
+            "phpsessid",
         ]
-        return any(p.lower() in haystack for p in patterns)
+        return any(marker in lowered for marker in markers)
 
-    def _extract_preflight_failure_reason(self) -> str:
-        patterns = [
+    def _looks_like_auth_failure(self) -> bool:
+        haystack = self._recent_failure_text()
+        lowered = haystack.lower()
+        non_repairable_870_markers = [
+            "870 network mode",
+            "抓取870数据",
             "870登录态不可用",
-            "分析后台登录态预检失败",
-            "505后台登录态预检失败",
-            "PC后台登录态预检失败",
-            "PC会员登录态预检失败",
-            "扩展登录态预检失败",
-            "fenxi token 预检失败",
+            "870登录态预检失败",
+            "admin.buke999.com",
+            "session cookie may be invalid",
+            "session_cookie",
+            "response is not valid json",
         ]
-        for line in reversed(self.log_history[-120:]):
-            text = str(line).strip()
-            if not text:
-                continue
-            for pattern in patterns:
-                if pattern in text:
-                    return text
-        return "全平台登录态预检未通过，请查看日志中的具体失败平台。"
+        if any(marker in lowered for marker in non_repairable_870_markers):
+            return False
+        return bool(classify_auth_failure(haystack))
+
+    def open_870_cookie_repair_dialog(self) -> None:
+        if self._is_busy():
+            messagebox.showinfo("提示", "当前有任务在执行，请稍后再修复 870 PHPSESSID。")
+            return
+        self.prompt_870_cookie_repair(retry_after_save=False)
+
+    def _current_870_session_cookie(self) -> str:
+        cfg = self._load_config()
+        return str(cfg.get("session_cookie") or "").strip()
+
+    def _normalize_870_session_cookie(self, value: str) -> str:
+        raw = str(value or "").strip()
+        if raw.lower().startswith("session_cookie:"):
+            raw = raw.split(":", 1)[1].strip()
+        raw = raw.strip().strip('"').strip("'")
+        if not raw:
+            raise ValueError("PHPSESSID 不能为空。")
+        if "=" not in raw:
+            raw = f"PHPSESSID={raw}"
+        if "phpsessid=" not in raw.lower():
+            raise ValueError("请填写 PHPSESSID=... 或 PHPSESSID 的值。")
+        return raw
+
+    def _write_870_session_cookie(self, cookie: str) -> Path:
+        if not self.config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {self.config_path}")
+
+        original = self.config_path.read_text(encoding="utf-8")
+        backup_path = self.config_path.with_name(
+            f"{self.config_path.name}.bak-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        )
+        line = f"session_cookie: {json.dumps(cookie, ensure_ascii=False)}"
+        if re.search(r"(?m)^session_cookie\s*:", original):
+            updated = re.sub(r"(?m)^session_cookie\s*:.*$", line, original, count=1)
+        else:
+            suffix = "" if original.endswith("\n") else "\n"
+            updated = f"{original}{suffix}{line}\n"
+
+        parsed = yaml.safe_load(updated)
+        if not isinstance(parsed, dict):
+            raise ValueError("config.yaml 结构异常，未写入 PHPSESSID。")
+
+        shutil.copy2(self.config_path, backup_path)
+        temp_path = self.config_path.with_name(f".{self.config_path.name}.tmp-{os.getpid()}")
+        temp_path.write_text(updated, encoding="utf-8")
+        os.replace(temp_path, self.config_path)
+        backups = sorted(
+            self.config_path.parent.glob(f"{self.config_path.name}.bak-*"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for stale_backup in backups[3:]:
+            stale_backup.unlink()
+        return backup_path
+
+    def prompt_870_cookie_repair(self, *, retry_after_save: bool) -> bool:
+        current_cookie = self._current_870_session_cookie()
+        initial_value = current_cookie or "PHPSESSID="
+        dialog = tk.Toplevel(self.root)
+        dialog.title("修复 870 PHPSESSID")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        cookie_var = tk.StringVar(value=initial_value)
+        result: Dict[str, str] = {}
+
+        frame = ttk.Frame(dialog, padding=16)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="检测到 870 数据请求疑似登录态失效。", style="Body.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w"
+        )
+        ttk.Label(frame, text='请检查并更新 session_cookie: "PHPSESSID=..."', style="Muted.TLabel").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(4, 12)
+        )
+        ttk.Label(frame, text="session_cookie", style="Body.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 8))
+        entry = ttk.Entry(frame, width=58, textvariable=cookie_var)
+        entry.grid(row=2, column=1, sticky="ew")
+        ttk.Label(
+            frame,
+            text="可粘贴完整 PHPSESSID=xxx，也可以只填 session 值；日志不会打印完整 Cookie。",
+            style="Muted.TLabel",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=4, column=0, columnspan=2, sticky="e", pady=(16, 0))
+
+        def _confirm() -> None:
+            try:
+                result["cookie"] = self._normalize_870_session_cookie(cookie_var.get())
+            except ValueError as exc:
+                messagebox.showerror("输入错误", str(exc), parent=dialog)
+                return
+            dialog.destroy()
+
+        def _cancel() -> None:
+            dialog.destroy()
+
+        ttk.Button(button_row, text="取消", style="Ghost.TButton", command=_cancel).pack(side=tk.LEFT)
+        ttk.Button(button_row, text="确认并写回", style="Primary.TButton", command=_confirm).pack(side=tk.LEFT, padx=(8, 0))
+
+        entry.focus_set()
+        entry.selection_range(0, tk.END)
+        dialog.bind("<Return>", lambda _event: _confirm())
+        dialog.bind("<Escape>", lambda _event: _cancel())
+        self.root.wait_window(dialog)
+
+        cookie = result.get("cookie")
+        if not cookie:
+            return False
+        try:
+            backup_path = self._write_870_session_cookie(cookie)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("写入失败", f"写回 config.yaml 失败：{exc}")
+            return False
+
+        self._append_log(f"[GUI] 已更新 870 PHPSESSID，原配置已备份：{backup_path.name}")
+        messagebox.showinfo("修复完成", "870 PHPSESSID 已写回 config.yaml。")
+        if retry_after_save:
+            self.has_870_cookie_retried = True
+            self.status_text.set("870 PHPSESSID 已更新，任务重试中")
+            self._append_log("[GUI] 870 PHPSESSID 修复完成，开始自动重试任务")
+            self.start_run(from_auto_retry=True)
+        return True
 
     def start_auth_recovery_and_retry(self) -> None:
         if self._is_busy():
-            messagebox.showinfo("提示", "当前有任务在执行，请稍后再试。")
+            messagebox.showinfo("Busy", "A task is already running. Try again later.")
             return
-        env = os.environ.copy()
-        env.update(self._load_scheduler_env())
         self.aux_running = True
-        self.status_text.set("执行登录修复中")
+        self.status_text.set("Running auth repair")
         extra_auth_file = self._extra_auth_path()
-        preflight_cmd = self._build_cli_command(
+        cmd = self._build_cli_command(
             "--config",
             str(self.config_path),
             "--date",
             self.date_value.get().strip(),
-            "--check-extra-auth",
+            "--no-runtime-gui",
+            "--with-extra-metrics",
+            "--extra-auth-file",
+            str(extra_auth_file),
+            "--repair-auth-only",
+            "--auth-repair-browser",
+            "chrome",
+            "--auth-repair-profile",
+            str(self.project_root / "output" / "auth_profiles" / "chrome_daily_report"),
+            "--auth-repair-timeout-seconds",
+            "300",
+            "--auth-repair-target",
+            "both",
         )
 
         def _worker() -> None:
             try:
                 self.queue.put(("line", "=" * 84))
-                self.queue.put(("line", "[GUI] 自动登录修复"))
-                result = recover_auth(
-                    RecoverySettings(
-                        extra_auth_file=extra_auth_file,
-                        output=extra_auth_file,
-                        pc_login_url="http://yadmin.4399.com/",
-                        fenxi_url="https://fenxi.4399dev.com/analysis/",
-                        timeout_seconds=300,
-                        browser_channel="",
-                        phone="",
-                        sms_code="",
-                        ask_sms=True,
-                        auto_fill=True,
-                        skip_pc=False,
-                        skip_fenxi=False,
-                    )
+                self.queue.put(("line", "[GUI] Running thin auth repair"))
+                self.queue.put(("line", "执行命令: " + " ".join(cmd)))
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(self.project_root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env={**os.environ.copy(), **self._load_scheduler_env()},
                 )
-                self.queue.put(("line", json.dumps(result, ensure_ascii=False)))
-                rc = self._run_streaming_cmd(preflight_cmd, env, "登录态预检")
-                if rc != 0:
-                    self.queue.put(("recover_done", (False, f"登录态预检失败，退出码={rc}")))
-                    return
-                self.queue.put(("recover_done", (True, "")))
+                assert proc.stdout is not None
+                for raw_line in proc.stdout:
+                    self.queue.put(("line", raw_line.rstrip("\n")))
+                rc = proc.wait()
+                self.queue.put(("recover_done", (rc == 0, "" if rc == 0 else f"退出码={rc}")))
             except Exception as exc:  # noqa: BLE001
                 self.queue.put(("line", f"[GUI ERROR] {exc}"))
                 self.queue.put(("recover_done", (False, str(exc))))
@@ -846,7 +1238,7 @@ class ReportLauncherApp:
             messagebox.showerror("文件不存在", f"未找到已生成的主日报文件：{report_path}")
             return
         self.feishu_url_main.set("")
-        self.btn_open_feishu_main.configure(state=tk.DISABLED)
+        self._set_feishu_menu_state()
         cmd = self._build_cli_command(
             "--config",
             str(self.config_path),
@@ -855,6 +1247,7 @@ class ReportLauncherApp:
             "--no-runtime-gui",
             "--push-report-file",
             str(report_path),
+            "--force-publish",
         )
         self._run_aux_command("补推主日报飞书", cmd)
 
@@ -868,7 +1261,7 @@ class ReportLauncherApp:
             messagebox.showerror("文件不存在", f"未找到已生成的PC日报文件：{report_path}")
             return
         self.feishu_url_pc.set("")
-        self.btn_open_feishu_pc.configure(state=tk.DISABLED)
+        self._set_feishu_menu_state()
         cmd = self._build_cli_command(
             "--config",
             str(self.config_path),
@@ -877,6 +1270,7 @@ class ReportLauncherApp:
             "--no-runtime-gui",
             "--push-pc-report-file",
             str(report_path),
+            "--force-publish",
         )
         self._run_aux_command("补推PC日报飞书", cmd)
 
@@ -905,6 +1299,7 @@ class ReportLauncherApp:
             "--push-wecom-reports",
             "--wecom-target",
             target,
+            "--force-publish",
         )
         label = "推送企业微信-单人" if target == "single" else "推送企业微信-群"
         self._run_aux_command(label, cmd)
@@ -962,6 +1357,58 @@ class ReportLauncherApp:
         log_dir.mkdir(parents=True, exist_ok=True)
         webbrowser.open(log_dir.as_uri(), new=2)
 
+    def open_output_dir(self) -> None:
+        output_dir = self.project_root / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        webbrowser.open(output_dir.as_uri(), new=2)
+
+    def edit_schedule_time(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("设置定时任务时间")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        hour_var = tk.StringVar(value=self.schedule_hour.get().strip() or "09")
+        minute_var = tk.StringVar(value=self.schedule_minute.get().strip() or "00")
+
+        frame = ttk.Frame(dialog, padding=16)
+        frame.grid(row=0, column=0, sticky="nsew")
+        ttk.Label(frame, text="每天执行时间", style="Body.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
+        hour_spin = ttk.Spinbox(frame, from_=0, to=23, width=4, textvariable=hour_var, format="%02.0f")
+        hour_spin.grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(frame, text=":", style="Body.TLabel").grid(row=1, column=1, padx=6, pady=(10, 0))
+        ttk.Spinbox(frame, from_=0, to=59, width=4, textvariable=minute_var, format="%02.0f").grid(
+            row=1, column=2, sticky="w", pady=(10, 0)
+        )
+
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=2, column=0, columnspan=4, sticky="e", pady=(16, 0))
+
+        def _save() -> None:
+            hour_text = hour_var.get().strip()
+            minute_text = minute_var.get().strip()
+            if not hour_text.isdigit() or not minute_text.isdigit():
+                messagebox.showerror("时间错误", "小时和分钟必须是数字。", parent=dialog)
+                return
+            hour = int(hour_text)
+            minute = int(minute_text)
+            if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+                messagebox.showerror("时间错误", "请填写有效时间（小时0-23，分钟0-59）。", parent=dialog)
+                return
+            self.schedule_hour.set(f"{hour:02d}")
+            self.schedule_minute.set(f"{minute:02d}")
+            self._update_schedule_menu_labels()
+            self._append_log(f"[GUI] 定时任务执行时间已设置为 {hour:02d}:{minute:02d}")
+            dialog.destroy()
+
+        ttk.Button(button_row, text="取消", style="Ghost.TButton", command=dialog.destroy).pack(side=tk.LEFT)
+        ttk.Button(button_row, text="保存", style="Primary.TButton", command=_save).pack(side=tk.LEFT, padx=(8, 0))
+        hour_spin.focus_set()
+        dialog.bind("<Return>", lambda _event: _save())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        self.root.wait_window(dialog)
+
     def _launchd_plist_path(self) -> Path:
         return Path.home() / "Library" / "LaunchAgents" / f"{self.LAUNCHD_LABEL}.plist"
 
@@ -975,16 +1422,16 @@ class ReportLauncherApp:
         plist = self._launchd_plist_path()
         exists = plist.exists()
         if not self._ensure_macos_silent():
-            self.schedule_status.set("定时任务：仅 macOS 支持此区域")
+            self._set_schedule_status("定时任务：仅 macOS 支持此区域")
             return
         result = subprocess.run(["launchctl", "list", self.LAUNCHD_LABEL], capture_output=True, text=True)
         if result.returncode == 0:
-            self.schedule_status.set(f"定时任务：已加载（{self.LAUNCHD_LABEL}）")
+            self._set_schedule_status(f"定时任务：已加载（{self.LAUNCHD_LABEL}）")
             return
         if exists:
-            self.schedule_status.set("定时任务：已配置但未加载（可点安装/更新）")
+            self._set_schedule_status("定时任务：已配置但未加载（可点安装/更新）")
         else:
-            self.schedule_status.set("定时任务：未安装")
+            self._set_schedule_status("定时任务：未安装")
 
     def _ensure_macos_silent(self) -> bool:
         return os.name == "posix" and "darwin" in os.uname().sysname.lower()

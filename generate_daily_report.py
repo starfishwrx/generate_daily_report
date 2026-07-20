@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import argparse
-import dataclasses
 import html
 import json
 import logging
@@ -18,23 +17,28 @@ import math
 import os
 import re
 import sys
+import time as monotonic_time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
-from zoneinfo import ZoneInfo
-
 import requests
 import yaml
+from app_paths import ensure_first_run_config, migrate_legacy_runtime_files, resolve_app_paths
 from dateutil import parser as date_parser
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
+from auth_repair import AgentRepairCoordinator, AuthRepairSettings, classify_auth_failure
 from extra_auth import build_extra_auth_file, inspect_fenxi_token, load_extra_auth, load_extra_auth_meta
 from extra_metrics_render import render_extra_metrics_block, render_payment_table_images
 from extra_metrics_service import ExtraMetricsService, ExtraSettings
 from feishu_doc import FeishuDocError, FeishuDocSettings, publish_report_to_feishu_doc
 from network_hosts import load_hosts_map, rewrite_url_with_hosts_map
 from pc_web_metrics_service import PCWebMetricsService, PCWebSettings
+from publish_state import PublishStateStore, content_hash
+from run_lock import AlreadyRunningError, single_instance_lock
+from tz_compat import get_tzinfo
 from wecom_longbot import WeComBotError, WeComBotSettings, publish_reports_to_wecom
 
 
@@ -51,16 +55,25 @@ def bundle_base_path() -> Path:
     return Path(__file__).resolve().parent
 
 
-def default_config_path() -> Path:
+def executable_base_path() -> Path:
     if is_frozen():
-        cwd_config = Path.cwd() / "config.yaml"
-        if cwd_config.exists():
-            return cwd_config
-    return bundle_base_path() / "config.yaml"
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def default_extra_auth_path() -> Path:
+    return resolve_app_paths().extra_auth
+
+
+def default_config_path() -> Path:
+    return resolve_app_paths().config
 
 
 def default_template_dir() -> Path:
     if is_frozen():
+        exe_templates = executable_base_path() / "templates"
+        if exe_templates.exists():
+            return exe_templates
         cwd_templates = Path.cwd() / "templates"
         if cwd_templates.exists():
             return cwd_templates
@@ -68,16 +81,14 @@ def default_template_dir() -> Path:
 
 
 def default_output_dir() -> Path:
-    if is_frozen():
-        return Path.cwd() / "output"
-    return bundle_base_path() / "output"
+    return resolve_app_paths().output
 
 
 DEFAULT_CONFIG_PATH = default_config_path()
 DEFAULT_TEMPLATE_DIR = default_template_dir()
 DEFAULT_TEMPLATE_NAME = "report_template.j2"
 DEFAULT_OUTPUT_DIR = default_output_dir()
-DEFAULT_EXTRA_AUTH_FILE = bundle_base_path() / "extra_auth.json"
+DEFAULT_EXTRA_AUTH_FILE = default_extra_auth_path()
 DEFAULT_CHART_DIR = DEFAULT_OUTPUT_DIR / "charts"
 DEFAULT_TIME_FIELD = "ctime"
 _FONT_CONFIGURED = False
@@ -212,6 +223,12 @@ class TargetResult:
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate daily cloud gaming report.")
     parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="Runtime data directory (config, auth, output). Defaults to the user-local app directory in packaged builds.",
+    )
+    parser.add_argument(
         "--config",
         type=Path,
         default=DEFAULT_CONFIG_PATH,
@@ -289,6 +306,45 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Only check full auth status and exit (870 + fenxi/505 + pc_web).",
     )
     parser.add_argument(
+        "--skip-870-auth-preflight",
+        action="store_true",
+        help="Skip the 870 session-cookie preflight; used by fenxi/PC auth repair paths.",
+    )
+    parser.add_argument(
+        "--repair-auth-on-failure",
+        action="store_true",
+        help="Open a dedicated Chrome auth repair window when fenxi/PC Web auth preflight fails.",
+    )
+    parser.add_argument(
+        "--repair-auth-only",
+        action="store_true",
+        help="Run the fenxi/PC Web Chrome auth repair flow, then exit after preflight.",
+    )
+    parser.add_argument(
+        "--auth-repair-browser",
+        type=str,
+        default=None,
+        help="Browser for auth repair (first version supports chrome).",
+    )
+    parser.add_argument(
+        "--auth-repair-profile",
+        type=Path,
+        default=None,
+        help="Dedicated Chrome profile directory for auth repair.",
+    )
+    parser.add_argument(
+        "--auth-repair-timeout-seconds",
+        type=int,
+        default=None,
+        help="Seconds to wait for manual browser login during auth repair.",
+    )
+    parser.add_argument(
+        "--auth-repair-target",
+        choices=["auto", "fenxi", "pc_web", "both"],
+        default=None,
+        help="Auth repair target. auto infers from the failure; no-failure repair defaults to both.",
+    )
+    parser.add_argument(
         "--extra-auth-max-age-hours",
         type=int,
         default=24,
@@ -352,6 +408,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--no-push-feishu-doc",
         action="store_true",
         help="Disable Feishu doc publish for this run.",
+    )
+    parser.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="Generate and validate reports without publishing to Feishu or WeCom.",
+    )
+    parser.add_argument(
+        "--force-publish",
+        action="store_true",
+        help="Ignore completed publish state and publish again.",
+    )
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=4,
+        help="Maximum concurrent data requests (default: 4).",
     )
     parser.add_argument(
         "--push-report-file",
@@ -658,10 +730,7 @@ def get_extra_auth_age_hours(path: Path, meta: Dict[str, Any]) -> Optional[float
 
 
 def _format_dt_with_tz(dt: datetime, tz_name: str) -> str:
-    try:
-        local_tz = ZoneInfo(tz_name)
-    except Exception:
-        local_tz = timezone.utc
+    local_tz = get_tzinfo(tz_name)
     local_dt = dt.astimezone(local_tz)
     return local_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
 
@@ -766,10 +835,11 @@ def run_full_auth_preflight(
 ) -> None:
     report_date_for_check = resolve_report_date(args.date)
 
-    auth_870 = preflight_870_auth(config, args, report_date_for_check)
-    logging.info("870: %s", auth_870.get("message", ""))
-    if not is_preflight_ok(auth_870.get("ok")):
-        raise ReportError(str(auth_870.get("message") or "870登录态预检失败"))
+    if not bool(getattr(args, "skip_870_auth_preflight", False)):
+        auth_870 = preflight_870_auth(config, args, report_date_for_check)
+        logging.info("870: %s", auth_870.get("message", ""))
+        if not is_preflight_ok(auth_870.get("ok")):
+            raise ReportError(str(auth_870.get("message") or "870登录态预检失败"))
 
     pc_web_cfg = config.get("pc_web_metrics") or {}
     needs_extension_preflight = bool(args.with_extra_metrics or extra_metrics_cfg.get("enabled") or pc_web_cfg.get("enabled"))
@@ -826,16 +896,6 @@ def run_full_auth_preflight(
         strict_mode = bool(pc_web_cfg.get("strict", True))
         pc_auth_key = str(pc_web_cfg.get("auth_key", "pc_web")).strip() or "pc_web"
         pc_auth = extra_auth.get(pc_auth_key) or extra_auth.get("pc_web")
-        pc_hosts_yaml_path = (
-            args.hosts_yaml_path
-            if args.hosts_yaml_path is not None
-            else str(pc_web_cfg.get("hosts_yaml_path") or extra_metrics_cfg.get("hosts_yaml_path", ""))
-        )
-        pc_query_proxy_url = (
-            args.query_proxy_url
-            if args.query_proxy_url is not None
-            else str(pc_web_cfg.get("query_proxy_url") or extra_metrics_cfg.get("query_proxy_url", ""))
-        )
         pc_service = create_pc_web_service(config, args, extra_metrics_cfg)
         pc_preflight = asyncio.run(pc_service.preflight(report_date_for_check, pc_auth))
         pc_ok = bool((pc_preflight or {}).get("ok"))
@@ -855,6 +915,230 @@ def run_full_auth_preflight(
                 raise ReportError(f"PC会员登录态预检失败: {member_msg}")
 
 
+def _env_bool(name: str) -> Optional[bool]:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _env_int(name: str) -> Optional[int]:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _repo_relative_path(raw: Any, default: Path) -> Path:
+    path = Path(str(raw or default)).expanduser()
+    if path.is_absolute():
+        return path
+    return (bundle_base_path() / path).resolve()
+
+
+def auth_repair_enabled(config: Dict[str, Any], args: argparse.Namespace) -> bool:
+    env_value = _env_bool("AUTH_REPAIR_ENABLED")
+    if env_value is None:
+        env_value = _env_bool("RUN_AUTH_REPAIR")
+    cfg = config.get("auth_repair") or {}
+    return bool(args.repair_auth_on_failure or env_value or cfg.get("enabled", False))
+
+
+def resolve_auth_repair_settings(
+    config: Dict[str, Any],
+    args: argparse.Namespace,
+    extra_metrics_cfg: Dict[str, Any],
+    extra_auth_file: Path,
+) -> AuthRepairSettings:
+    auth_cfg = config.get("auth_repair") or {}
+    if not isinstance(auth_cfg, dict):
+        auth_cfg = {}
+    pc_web_cfg = config.get("pc_web_metrics") or {}
+    if not isinstance(pc_web_cfg, dict):
+        pc_web_cfg = {}
+
+    raw_targets = auth_cfg.get("targets")
+    cfg_target = str(auth_cfg.get("target") or "").strip()
+    if isinstance(raw_targets, list):
+        normalized_targets = {str(item).strip().lower() for item in raw_targets if str(item).strip()}
+        if {"fenxi", "pc_web"}.issubset(normalized_targets):
+            cfg_target = "both"
+        elif "fenxi" in normalized_targets:
+            cfg_target = "fenxi"
+        elif "pc_web" in normalized_targets:
+            cfg_target = "pc_web"
+    target = str(args.auth_repair_target or os.getenv("AUTH_REPAIR_TARGET") or cfg_target or "auto").strip().lower()
+
+    profile_default = DEFAULT_OUTPUT_DIR / "auth_profiles" / "chrome_daily_report"
+    profile = _repo_relative_path(
+        args.auth_repair_profile
+        or os.getenv("AUTH_REPAIR_PROFILE")
+        or auth_cfg.get("profile_dir")
+        or profile_default,
+        profile_default,
+    )
+    chain_candidates = auth_cfg.get("pc_chain_candidates") or auth_cfg.get("pc_chains") or [545]
+    if not isinstance(chain_candidates, list):
+        chain_candidates = [chain_candidates]
+    pc_probe_urls = auth_cfg.get("pc_probe_urls") or auth_cfg.get("pc_probe_url") or [
+        "http://yadmin.4399.com/#/statistics/game-start"
+    ]
+    if not isinstance(pc_probe_urls, list):
+        pc_probe_urls = [pc_probe_urls]
+    fenxi_probe_urls = auth_cfg.get("fenxi_probe_urls") or auth_cfg.get("fenxi_probe_url") or [
+        "https://fenxi.4399dev.com/analysis/"
+    ]
+    if not isinstance(fenxi_probe_urls, list):
+        fenxi_probe_urls = [fenxi_probe_urls]
+
+    return AuthRepairSettings(
+        extra_auth_file=Path(extra_auth_file),
+        output=Path(extra_auth_file),
+        profile_dir=profile,
+        browser=str(args.auth_repair_browser or os.getenv("AUTH_REPAIR_BROWSER") or auth_cfg.get("browser") or "chrome").strip(),
+        chrome_executable=str(
+            os.getenv("AUTH_REPAIR_CHROME")
+            or auth_cfg.get("chrome_executable")
+            or r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+        ).strip(),
+        pc_login_url=str(auth_cfg.get("pc_login_url") or pc_web_cfg.get("web_origin") or "http://yadmin.4399.com/").strip(),
+        pc_probe_urls=[str(value).strip() for value in pc_probe_urls if str(value).strip()],
+        fenxi_url=str(auth_cfg.get("fenxi_url") or "https://fenxi.4399dev.com/analysis/").strip(),
+        fenxi_probe_urls=[str(value).strip() for value in fenxi_probe_urls if str(value).strip()],
+        pc_base_url=str(pc_web_cfg.get("base") or auth_cfg.get("pc_base_url") or "http://yapiadmin.4399.com").strip(),
+        pc_web_origin=str(pc_web_cfg.get("web_origin") or auth_cfg.get("pc_web_origin") or "http://yadmin.4399.com").strip(),
+        pc_request_timeout=int(pc_web_cfg.get("request_timeout", extra_metrics_cfg.get("request_timeout", 20))),
+        hosts_yaml_path=str(
+            args.hosts_yaml_path
+            if args.hosts_yaml_path is not None
+            else pc_web_cfg.get("hosts_yaml_path") or extra_metrics_cfg.get("hosts_yaml_path", "")
+        ).strip(),
+        query_proxy_url=str(
+            args.query_proxy_url
+            if args.query_proxy_url is not None
+            else pc_web_cfg.get("query_proxy_url") or extra_metrics_cfg.get("query_proxy_url", "")
+        ).strip(),
+        timeout_seconds=int(
+            args.auth_repair_timeout_seconds
+            or _env_int("AUTH_REPAIR_TIMEOUT_SECONDS")
+            or auth_cfg.get("timeout_seconds")
+            or 300
+        ),
+        target=target,
+        auto_close=bool(auth_cfg.get("auto_close", True)),
+        pc_chain_candidates=[int(value) for value in chain_candidates if str(value).strip().lstrip("-").isdigit()],
+    )
+
+
+def write_run_state(output_dir: Path, report_date: date, updates: Dict[str, Any]) -> None:
+    state_dir = Path(output_dir) / "run_state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_path = state_dir / f"{report_date.strftime('%Y%m%d')}.json"
+    state: Dict[str, Any] = {}
+    if state_path.exists():
+        try:
+            loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                state = loaded
+        except json.JSONDecodeError:
+            state = {}
+    state.update(updates)
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def run_auth_repair(
+    config: Dict[str, Any],
+    args: argparse.Namespace,
+    extra_metrics_cfg: Dict[str, Any],
+    extra_auth_file: Path,
+    *,
+    reason_text: str = "",
+) -> Dict[str, Any]:
+    settings = resolve_auth_repair_settings(config, args, extra_metrics_cfg, extra_auth_file)
+    coordinator = AgentRepairCoordinator(settings=settings, log_dir=Path(args.output) / "auth_repair_logs")
+    try:
+        result = coordinator.run(reason_text=reason_text)
+    except Exception as exc:  # noqa: BLE001
+        raise ReportError(f"登录态自动修复失败: {exc}") from exc
+    logging.info("认证自动修复完成: targets=%s log=%s", ",".join(result.get("updated_targets") or []), result.get("log_path", ""))
+    return result
+
+
+def run_full_auth_preflight_with_repair(
+    config: Dict[str, Any],
+    args: argparse.Namespace,
+    extra_metrics_cfg: Dict[str, Any],
+    extra_auth_file: Path,
+    *,
+    phase: str,
+) -> None:
+    report_date_for_check = resolve_report_date(args.date)
+    try:
+        run_full_auth_preflight(config, args, extra_metrics_cfg, extra_auth_file)
+        write_run_state(Path(args.output), report_date_for_check, {"preflight_result": "ok", "last_phase": phase})
+        return
+    except ReportError as exc:
+        reason_text = str(exc)
+        write_run_state(
+            Path(args.output),
+            report_date_for_check,
+            {"last_phase": phase, "failure_stage": "auth_preflight", "failure_reason": reason_text},
+        )
+        if not auth_repair_enabled(config, args):
+            raise
+        repair_targets = sorted(classify_auth_failure(reason_text))
+        if not repair_targets:
+            logging.info("认证失败不属于 fenxi/PC Web 登录态，跳过自动修复: %s", reason_text)
+            raise
+        emit_progress(9, "登录态失效，打开 Chrome 修复窗口")
+        original_repair_target = args.auth_repair_target
+        if str(args.auth_repair_target or "auto").strip().lower() == "auto":
+            args.auth_repair_target = "both"
+        try:
+            result = run_auth_repair(config, args, extra_metrics_cfg, extra_auth_file, reason_text=reason_text)
+        except ReportError as repair_exc:
+            write_run_state(
+                Path(args.output),
+                report_date_for_check,
+                {
+                    "last_phase": "auth_repair",
+                    "repair_targets": repair_targets,
+                    "repair_attempted": True,
+                    "repair_result": "failed",
+                    "repair_failure_reason": str(repair_exc),
+                },
+            )
+            raise
+        finally:
+            args.auth_repair_target = original_repair_target
+        write_run_state(
+            Path(args.output),
+            report_date_for_check,
+            {
+                "last_phase": "auth_repair",
+                "repair_targets": repair_targets,
+                "repair_attempted": True,
+                "repair_result": "ok",
+                "auth_repair_log": result.get("log_path", ""),
+            },
+        )
+        run_full_auth_preflight(config, args, extra_metrics_cfg, extra_auth_file)
+        write_run_state(
+            Path(args.output),
+            report_date_for_check,
+            {"preflight_result": "ok_after_repair", "last_phase": phase},
+        )
+
+
 def is_preflight_ok(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -865,7 +1149,7 @@ def should_push_feishu_doc(args: argparse.Namespace, config: Dict[str, Any]) -> 
     feishu_cfg = config.get("feishu_doc") or {}
     if not isinstance(feishu_cfg, dict):
         raise ReportError("Config field feishu_doc must be a mapping when provided.")
-    if args.no_push_feishu_doc:
+    if getattr(args, "no_publish", False) or args.no_push_feishu_doc:
         return False
     if args.push_feishu_doc:
         return True
@@ -988,10 +1272,22 @@ def build_existing_payment_images(report_base_dir: Path, report_date: date) -> D
     }
 
 
-def should_push_wecom_bot(config: Dict[str, Any]) -> bool:
+def build_publish_hash(report_file: Path, image_paths: Iterable[str] = ()) -> str:
+    parts: List[Union[str, bytes, Path]] = [report_file]
+    for raw_path in sorted(str(value) for value in image_paths if str(value).strip()):
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = report_file.parent / path
+        parts.append(path)
+    return content_hash(parts)
+
+
+def should_push_wecom_bot(config: Dict[str, Any], args: Optional[argparse.Namespace] = None) -> bool:
     wecom_cfg = config.get("wecom_bot") or {}
     if not isinstance(wecom_cfg, dict):
         raise ReportError("Config field wecom_bot must be a mapping when provided.")
+    if args is not None and getattr(args, "no_publish", False):
+        return False
     return bool(wecom_cfg.get("enabled", False))
 
 
@@ -1840,7 +2136,8 @@ def render_report(
     extra_metrics_block: Optional[str] = None,
 ) -> Path:
     template_dir = prepare_template_directory(template_dir, template_name, DEFAULT_TEMPLATE_CONTENT)
-    env = Environment(
+    # This template renders plain text/Markdown rather than executable HTML.
+    env = Environment(  # nosec B701
         loader=FileSystemLoader(str(template_dir)),
         undefined=StrictUndefined,
         trim_blocks=True,
@@ -2082,7 +2379,8 @@ def render_pc_report(
     pc_warnings: Optional[List[str]] = None,
 ) -> Path:
     template_dir = prepare_template_directory(template_dir, template_name, DEFAULT_PC_TEMPLATE_CONTENT)
-    env = Environment(
+    # This template renders plain text/Markdown rather than executable HTML.
+    env = Environment(  # nosec B701
         loader=FileSystemLoader(str(template_dir)),
         undefined=StrictUndefined,
         trim_blocks=True,
@@ -2197,13 +2495,42 @@ def create_pc_web_service(
             hosts_yaml_path=str(pc_hosts_yaml_path).strip(),
             fenxi_base=str(extra_metrics_cfg.get("fenxi_base", "https://fenxi.4399dev.com")).strip(),
             timezone=str(extra_metrics_cfg.get("timezone", "Asia/Shanghai")),
+            max_concurrency=args.max_concurrency,
         )
     )
+
+
+def _prepare_runtime_paths(args: argparse.Namespace) -> None:
+    paths = resolve_app_paths(args.data_dir)
+    if args.data_dir is not None:
+        if Path(args.config) == DEFAULT_CONFIG_PATH:
+            args.config = paths.config
+        if Path(args.output) == DEFAULT_OUTPUT_DIR:
+            args.output = paths.output
+        if Path(args.extra_auth_file) == DEFAULT_EXTRA_AUTH_FILE:
+            args.extra_auth_file = paths.extra_auth
+    migrated = migrate_legacy_runtime_files(paths)
+    ensure_first_run_config(paths)
+    for path in migrated:
+        logging.info("Migrated legacy runtime file to user data directory: %s", path)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
     setup_logging(args.verbose)
+    _prepare_runtime_paths(args)
+    if args.max_concurrency < 1:
+        raise ReportError("--max-concurrency 必须大于等于 1。")
+    lock_path = Path(args.output) / ".autodatareport.lock"
+    try:
+        with single_instance_lock(lock_path):
+            run_with_args(args)
+    except AlreadyRunningError as exc:
+        raise ReportError(str(exc)) from exc
+
+
+def run_with_args(args: argparse.Namespace) -> None:
+    total_started = monotonic_time.perf_counter()
     emit_progress(2, "初始化参数")
 
     config = load_config(args.config)
@@ -2219,6 +2546,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         emit_progress(20, "准备推送已有报告")
         title_override, title_prefix = resolve_feishu_doc_title(args, config)
         feishu_settings = resolve_feishu_doc_settings(args, config)
+        publish_store = PublishStateStore(report_file.parent, report_date_for_push)
+        publish_hash = build_publish_hash(report_file, [*chart_image_paths.values(), *payment_images.values()])
+        completed = None if args.force_publish else publish_store.completed_result("feishu_main", publish_hash)
+        if completed is not None:
+            logging.info("Feishu doc publish skipped (same content already completed): %s", completed.get("url", ""))
+            emit_progress(100, "内容未变化，已跳过重复推送")
+            return
         try:
             emit_progress(85, "推送飞书文档中")
             feishu_result = publish_report_to_feishu_doc(
@@ -2231,6 +2565,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 chart_image_paths=chart_image_paths,
                 payment_images=payment_images,
             )
+            publish_store.mark_completed("feishu_main", publish_hash, {"url": feishu_result.get("url", "")})
             logging.info("Feishu doc published: %s", feishu_result.get("url", ""))
             if feishu_result.get("markdown_length"):
                 logging.info("Feishu doc markdown length: %s", feishu_result.get("markdown_length"))
@@ -2248,6 +2583,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         emit_progress(20, "准备推送已有PC报告")
         pc_title_override, pc_title_prefix = resolve_feishu_pc_doc_title(config)
         feishu_settings = resolve_feishu_doc_settings(args, config)
+        publish_store = PublishStateStore(report_file.parent, report_date_for_push)
+        publish_hash = build_publish_hash(report_file, chart_image_paths.values())
+        completed = None if args.force_publish else publish_store.completed_result("feishu_pc", publish_hash)
+        if completed is not None:
+            logging.info("Feishu PC doc publish skipped (same content already completed): %s", completed.get("url", ""))
+            emit_progress(100, "内容未变化，已跳过重复推送")
+            return
         try:
             emit_progress(85, "推送PC飞书文档中")
             feishu_result = publish_report_to_feishu_doc(
@@ -2259,6 +2601,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 report_base_dir=report_file.parent,
                 chart_image_paths=chart_image_paths,
             )
+            publish_store.mark_completed("feishu_pc", publish_hash, {"url": feishu_result.get("url", "")})
             logging.info("Feishu PC doc published: %s", feishu_result.get("url", ""))
             if feishu_result.get("markdown_length"):
                 logging.info("Feishu PC doc markdown length: %s", feishu_result.get("markdown_length"))
@@ -2330,9 +2673,35 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if args.build_extra_auth_only:
             return
 
+    if args.repair_auth_only:
+        emit_progress(20, "打开 Chrome 修复 fenxi/PC 登录态")
+        result = run_auth_repair(config, args, extra_metrics_cfg, extra_auth_file)
+        report_date_for_state = resolve_report_date(args.date)
+        write_run_state(
+            Path(args.output),
+            report_date_for_state,
+            {
+                "last_phase": "auth_repair_only",
+                "repair_targets": result.get("updated_targets") or [],
+                "repair_attempted": True,
+                "repair_result": "ok",
+                "auth_repair_log": result.get("log_path", ""),
+            },
+        )
+        logging.info("fenxi/PC 登录态修复已完成；repair-only 不执行 870/505 全平台预检。")
+        write_run_state(Path(args.output), report_date_for_state, {"preflight_result": "skipped_for_repair_only"})
+        emit_progress(100, "认证修复完成")
+        return
+
     if args.check_extra_auth:
         emit_progress(20, "执行全平台登录态预检")
-        run_full_auth_preflight(config, args, extra_metrics_cfg, extra_auth_file)
+        run_full_auth_preflight_with_repair(
+            config,
+            args,
+            extra_metrics_cfg,
+            extra_auth_file,
+            phase="auth_check",
+        )
         logging.info("全平台登录态预检通过。")
         emit_progress(100, "预检通过")
         return
@@ -2354,8 +2723,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if gui_date:
             args.date = gui_date
 
+    auth_started = monotonic_time.perf_counter()
     emit_progress(8, "执行全平台登录态预检")
-    run_full_auth_preflight(config, args, extra_metrics_cfg, extra_auth_file)
+    run_full_auth_preflight_with_repair(
+        config,
+        args,
+        extra_metrics_cfg,
+        extra_auth_file,
+        phase="daily_report",
+    )
+    logging.info("[TIMING] stage=auth_preflight seconds=%.3f", monotonic_time.perf_counter() - auth_started)
     emit_progress(10, "全平台登录态预检通过")
 
     report_date = resolve_report_date(args.date)
@@ -2389,33 +2766,51 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     output_dir, charts_dir = ensure_output_dirs(args.output)
 
-    session = requests.Session()
-    configure_870_session(session, args, config)
-    session.headers.update({"Cookie": cookie, "User-Agent": config.get("user_agent", "Mozilla/5.0")})
-
+    collect_started = monotonic_time.perf_counter()
     results: Dict[str, TargetResult] = {}
-    total_targets = max(1, len(ordered_section_keys))
-    for idx, key in enumerate(ordered_section_keys, start=1):
-        target_progress = 15 + int((idx - 1) * 45 / total_targets)
-        emit_progress(target_progress, f"抓取870数据：{key}")
+    configured_keys: List[str] = []
+    for key in ordered_section_keys:
         target_cfg = targets_config.get(key)
         if not target_cfg:
             logging.warning("Target %s is listed in order but missing configuration.", key)
             continue
-        result = build_target_result(
-            key=key,
-            config=target_cfg,
-            session=session,
-            base_url=base_url,
-            base_date=report_date,
-            previous_date=report_date - timedelta(days=1),
-            timeout=timeout,
-            default_time_field=default_time_field,
-            default_http_method=default_http_method,
-            auto_query_params=auto_query_params,
-            previous_auto_query_params=previous_auto_query_params,
-            hosts_map=hosts_map_870,
-        )
+        configured_keys.append(key)
+
+    def collect_target(key: str) -> TargetResult:
+        session = requests.Session()
+        try:
+            configure_870_session(session, args, config)
+            session.headers.update({"Cookie": cookie, "User-Agent": config.get("user_agent", "Mozilla/5.0")})
+            return build_target_result(
+                key=key,
+                config=targets_config[key],
+                session=session,
+                base_url=base_url,
+                base_date=report_date,
+                previous_date=report_date - timedelta(days=1),
+                timeout=timeout,
+                default_time_field=default_time_field,
+                default_http_method=default_http_method,
+                auto_query_params=auto_query_params,
+                previous_auto_query_params=previous_auto_query_params,
+                hosts_map=hosts_map_870,
+            )
+        finally:
+            session.close()
+
+    total_targets = max(1, len(configured_keys))
+    max_workers = min(args.max_concurrency, total_targets)
+    emit_progress(15, f"并发抓取870数据（上限 {max_workers}）")
+    unordered_results: Dict[str, TargetResult] = {}
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="report-870") as executor:
+        futures = {executor.submit(collect_target, key): key for key in configured_keys}
+        for idx, future in enumerate(as_completed(futures), start=1):
+            key = futures[future]
+            unordered_results[key] = future.result()
+            emit_progress(15 + int(idx * 40 / total_targets), f"870数据完成：{key}")
+
+    for key in configured_keys:
+        result = unordered_results[key]
         if config.get("generate_charts", True) and not args.no_charts:
             chart_filename = f"{key}.png"
             chart_path = charts_dir / chart_filename
@@ -2423,6 +2818,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             if generated:
                 result.chart_path = generated.relative_to(output_dir)
         results[key] = result
+    logging.info("[TIMING] stage=collect_870 seconds=%.3f", monotonic_time.perf_counter() - collect_started)
     emit_progress(62, "870数据抓取完成")
 
     analysis_sentences: List[str] = []
@@ -2438,6 +2834,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     pc_report_member_summary: Dict[str, str] = {}
     pc_report_top_games: List[Dict[str, str]] = []
     pc_report_warnings: List[str] = []
+    extra_started = monotonic_time.perf_counter()
     if extra_metrics_enabled:
         emit_progress(68, "执行分析后台与505预检/抓取")
         extra_metrics_data: Dict[str, Any] = {"notes": {}, "top_games": [], "warnings": [], "payment_tables": {}}
@@ -2469,6 +2866,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 query_debug_log_path=(output_dir / "query_debug.jsonl"),
                 fenxi_base=str(extra_metrics_cfg.get("fenxi_base", "https://<FENXI_HOST>")).strip(),
                 manage_base=str(extra_metrics_cfg.get("manage_base", "http://<MANAGE_HOST>")).strip(),
+                max_concurrency=args.max_concurrency,
             )
             extra_service = ExtraMetricsService(extra_settings)
             try:
@@ -2507,8 +2905,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     if str(value).strip()
                 }
         extra_metrics_block = render_extra_metrics_block(extra_metrics_data)
+    logging.info("[TIMING] stage=extra_metrics seconds=%.3f", monotonic_time.perf_counter() - extra_started)
 
     pc_web_cfg = config.get("pc_web_metrics") or {}
+    pc_started = monotonic_time.perf_counter()
     if bool(pc_web_cfg.get("enabled")):
         emit_progress(74, "抓取PC后台数据")
         if not extra_auth_file.exists():
@@ -2548,8 +2948,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 if strict_mode:
                     raise ReportError(f"PC会员数据抓取失败: {exc}") from exc
                 pc_report_warnings.append(f"PC会员数据抓取失败: {exc}")
+    logging.info("[TIMING] stage=pc_metrics seconds=%.3f", monotonic_time.perf_counter() - pc_started)
     emit_progress(80, "渲染日报内容")
 
+    render_started = monotonic_time.perf_counter()
     output_path = render_report(
         template_dir=args.template_dir,
         template_name=args.template_name,
@@ -2566,33 +2968,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         for key, result in results.items()
         if result.chart_path is not None
     }
-    feishu_settings: Optional[FeishuDocSettings] = None
-    feishu_main_url = ""
-    if should_push_feishu_doc(args, config):
-        emit_progress(90, "推送飞书文档")
-        title_override, title_prefix = resolve_feishu_doc_title(args, config)
-        feishu_settings = resolve_feishu_doc_settings(args, config)
-        try:
-            feishu_result = publish_report_to_feishu_doc(
-                settings=feishu_settings,
-                report_text=output_path.read_text(encoding="utf-8"),
-                report_date=report_date,
-                title_override=title_override,
-                title_prefix=title_prefix,
-                report_base_dir=output_path.parent,
-                chart_image_paths=chart_image_paths,
-                payment_images=extra_payment_images,
-            )
-            feishu_main_url = str(feishu_result.get("url") or "").strip()
-            logging.info("Feishu doc published: %s", feishu_main_url)
-            if feishu_result.get("markdown_length"):
-                logging.info("Feishu doc markdown length: %s", feishu_result.get("markdown_length"))
-        except FeishuDocError as exc:
-            raise ReportError(f"飞书文档推送失败: {exc}") from exc
-
     pc_target = results.get("pc_cloud")
     pc_report_path: Optional[Path] = None
-    feishu_pc_url = ""
     if pc_target:
         pc_report_path = render_pc_report(
             template_dir=args.template_dir,
@@ -2606,35 +2983,87 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             pc_warnings=pc_report_warnings,
         )
         logging.info("PC cloud report generated: %s", pc_report_path)
+    logging.info("[TIMING] stage=render_reports seconds=%.3f", monotonic_time.perf_counter() - render_started)
+
+    publish_store = PublishStateStore(output_dir, report_date)
+    feishu_settings: Optional[FeishuDocSettings] = None
+    feishu_main_url = ""
+    if should_push_feishu_doc(args, config):
+        emit_progress(90, "推送飞书文档")
+        title_override, title_prefix = resolve_feishu_doc_title(args, config)
+        feishu_settings = resolve_feishu_doc_settings(args, config)
+        main_hash = build_publish_hash(output_path, [*chart_image_paths.values(), *extra_payment_images.values()])
+        completed = None if args.force_publish else publish_store.completed_result("feishu_main", main_hash)
+        if completed is not None:
+            feishu_main_url = str(completed.get("url") or "").strip()
+            logging.info("Feishu doc publish skipped (same content already completed): %s", feishu_main_url)
+        else:
+            publish_started = monotonic_time.perf_counter()
+            try:
+                feishu_result = publish_report_to_feishu_doc(
+                    settings=feishu_settings,
+                    report_text=output_path.read_text(encoding="utf-8"),
+                    report_date=report_date,
+                    title_override=title_override,
+                    title_prefix=title_prefix,
+                    report_base_dir=output_path.parent,
+                    chart_image_paths=chart_image_paths,
+                    payment_images=extra_payment_images,
+                )
+                feishu_main_url = str(feishu_result.get("url") or "").strip()
+                publish_store.mark_completed("feishu_main", main_hash, {"url": feishu_main_url})
+                logging.info("Feishu doc published: %s", feishu_main_url)
+                logging.info("[TIMING] stage=publish_feishu_main seconds=%.3f", monotonic_time.perf_counter() - publish_started)
+                if feishu_result.get("markdown_length"):
+                    logging.info("Feishu doc markdown length: %s", feishu_result.get("markdown_length"))
+            except FeishuDocError as exc:
+                raise ReportError(f"飞书文档推送失败: {exc}") from exc
+
+    feishu_pc_url = ""
+    if pc_target and pc_report_path is not None:
         if feishu_settings is None and should_push_feishu_doc(args, config):
             feishu_settings = resolve_feishu_doc_settings(args, config)
         if feishu_settings is not None and should_push_feishu_pc_doc(config):
             emit_progress(95, "推送PC飞书文档")
-            try:
-                pc_title_override, pc_title_prefix = resolve_feishu_pc_doc_title(config)
-                pc_chart_image_paths: Dict[str, str] = {}
-                if pc_target.chart_path is not None:
-                    pc_chart_image_paths["pc_cloud"] = str(pc_target.chart_path)
-                pc_result = publish_report_to_feishu_doc(
-                    settings=feishu_settings,
-                    report_text=pc_report_path.read_text(encoding="utf-8"),
-                    report_date=report_date,
-                    title_override=pc_title_override,
-                    title_prefix=pc_title_prefix,
-                    report_base_dir=pc_report_path.parent,
-                    chart_image_paths=pc_chart_image_paths,
-                )
-                feishu_pc_url = str(pc_result.get("url") or "").strip()
-                logging.info("Feishu PC doc published: %s", feishu_pc_url)
-                if pc_result.get("markdown_length"):
-                    logging.info("Feishu PC doc markdown length: %s", pc_result.get("markdown_length"))
-            except FeishuDocError as exc:
-                raise ReportError(f"PC飞书文档推送失败: {exc}") from exc
+            pc_title_override, pc_title_prefix = resolve_feishu_pc_doc_title(config)
+            pc_chart_image_paths: Dict[str, str] = {}
+            if pc_target.chart_path is not None:
+                pc_chart_image_paths["pc_cloud"] = str(pc_target.chart_path)
+            pc_hash = build_publish_hash(pc_report_path, pc_chart_image_paths.values())
+            completed = None if args.force_publish else publish_store.completed_result("feishu_pc", pc_hash)
+            if completed is not None:
+                feishu_pc_url = str(completed.get("url") or "").strip()
+                logging.info("Feishu PC doc publish skipped (same content already completed): %s", feishu_pc_url)
+            else:
+                publish_started = monotonic_time.perf_counter()
+                try:
+                    pc_result = publish_report_to_feishu_doc(
+                        settings=feishu_settings,
+                        report_text=pc_report_path.read_text(encoding="utf-8"),
+                        report_date=report_date,
+                        title_override=pc_title_override,
+                        title_prefix=pc_title_prefix,
+                        report_base_dir=pc_report_path.parent,
+                        chart_image_paths=pc_chart_image_paths,
+                    )
+                    feishu_pc_url = str(pc_result.get("url") or "").strip()
+                    publish_store.mark_completed("feishu_pc", pc_hash, {"url": feishu_pc_url})
+                    logging.info("Feishu PC doc published: %s", feishu_pc_url)
+                    logging.info("[TIMING] stage=publish_feishu_pc seconds=%.3f", monotonic_time.perf_counter() - publish_started)
+                    if pc_result.get("markdown_length"):
+                        logging.info("Feishu PC doc markdown length: %s", pc_result.get("markdown_length"))
+                except FeishuDocError as exc:
+                    raise ReportError(f"PC飞书文档推送失败: {exc}") from exc
 
-    if should_push_wecom_bot(config):
+    if should_push_wecom_bot(config, args):
         auto_targets = resolve_wecom_auto_targets(config)
         for target in auto_targets:
             emit_progress(98, f"推送企业微信({target})")
+            wecom_hash = content_hash([report_date.isoformat(), target, feishu_main_url, feishu_pc_url])
+            completed = None if args.force_publish else publish_store.completed_result(f"wecom_{target}", wecom_hash)
+            if completed is not None:
+                logging.info("WeCom bot publish skipped target=%s (same content already completed)", target)
+                continue
             try:
                 result = push_reports_to_wecom_target(
                     config=config,
@@ -2643,6 +3072,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     main_url=feishu_main_url,
                     pc_url=feishu_pc_url,
                 )
+                publish_store.mark_completed(f"wecom_{target}", wecom_hash, {"message_count": result.get("message_count", 0)})
                 logging.info(
                     "WeCom bot pushed target=%s chatid=%s messages=%s",
                     target,
@@ -2654,6 +3084,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 if strict:
                     raise ReportError(f"企业微信推送失败({target}): {exc}") from exc
                 logging.warning("WeCom bot push failed target=%s: %s", target, exc)
+    logging.info("[TIMING] stage=total seconds=%.3f", monotonic_time.perf_counter() - total_started)
     emit_progress(100, "任务完成")
 
 

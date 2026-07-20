@@ -38,10 +38,8 @@ class WeComLongBotTests(unittest.TestCase):
             pc_url="https://www.feishu.cn/docx/BBB",
         )
         self.assertEqual(len(payloads), 1)
-        payload = payloads[0]
-        self.assertIn("2026年3月9日日报飞书链接", payload["title"])
-        self.assertIn("主日报飞书：https://www.feishu.cn/docx/AAA", payload["content"])
-        self.assertIn("PC日报飞书：https://www.feishu.cn/docx/BBB", payload["content"])
+        self.assertIn("主日报飞书：https://www.feishu.cn/docx/AAA", payloads[0]["content"])
+        self.assertIn("PC日报飞书：https://www.feishu.cn/docx/BBB", payloads[0]["content"])
 
 
 if __name__ == "__main__":

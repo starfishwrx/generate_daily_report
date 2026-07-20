@@ -11,11 +11,7 @@ from feishu_doc import FeishuDocError, _request_with_retry
 class FeishuDocRetryTests(unittest.TestCase):
     def test_request_with_retry_recovers_after_timeouts(self) -> None:
         response = mock.Mock()
-        side_effects = [
-            requests.ReadTimeout("first timeout"),
-            requests.ReadTimeout("second timeout"),
-            response,
-        ]
+        side_effects = [requests.ReadTimeout("first timeout"), requests.ReadTimeout("second timeout"), response]
         with mock.patch("feishu_doc.requests.request", side_effect=side_effects) as mocked_request:
             with mock.patch("feishu_doc.time.sleep") as mocked_sleep:
                 result = _request_with_retry(
@@ -31,10 +27,7 @@ class FeishuDocRetryTests(unittest.TestCase):
         self.assertEqual(mocked_sleep.call_count, 2)
 
     def test_request_with_retry_raises_after_exhausted(self) -> None:
-        with mock.patch(
-            "feishu_doc.requests.request",
-            side_effect=requests.ReadTimeout("still timeout"),
-        ) as mocked_request:
+        with mock.patch("feishu_doc.requests.request", side_effect=requests.ReadTimeout("still timeout")) as mocked_request:
             with mock.patch("feishu_doc.time.sleep"):
                 with self.assertRaises(FeishuDocError):
                     _request_with_retry(

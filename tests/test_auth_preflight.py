@@ -23,13 +23,7 @@ class AuthPreflightTests(unittest.TestCase):
         self.assertEqual(query["params"]["game_type"], 1)
 
     def test_preflight_870_auth_reports_missing_cookie(self) -> None:
-        args = argparse.Namespace(
-            cookie=None,
-            proxy_mode=None,
-            http_proxy=None,
-            https_proxy=None,
-            network_hosts_yaml=None,
-        )
+        args = argparse.Namespace(cookie=None, proxy_mode=None, http_proxy=None, https_proxy=None, network_hosts_yaml=None)
         config = {
             "base_url": "http://admin.example.com/api",
             "network": {"proxy_mode": "direct"},
@@ -40,13 +34,7 @@ class AuthPreflightTests(unittest.TestCase):
         self.assertIn("Session cookie missing", result["message"])
 
     def test_preflight_870_auth_success(self) -> None:
-        args = argparse.Namespace(
-            cookie=None,
-            proxy_mode=None,
-            http_proxy=None,
-            https_proxy=None,
-            network_hosts_yaml=None,
-        )
+        args = argparse.Namespace(cookie=None, proxy_mode=None, http_proxy=None, https_proxy=None, network_hosts_yaml=None)
         config = {
             "base_url": "http://admin.example.com/api",
             "session_cookie": "PHPSESSID=test",

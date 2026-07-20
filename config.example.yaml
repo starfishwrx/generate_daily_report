@@ -145,6 +145,39 @@ extra_metrics:
   manage_hars:
     - "/path/to/manage_505.har"
 
+pc_web_metrics:
+  enabled: false
+  strict: true
+  auth_key: "pc_web"
+  base: "http://yapiadmin.4399.com"
+  web_origin: "http://yadmin.4399.com"
+  request_timeout: 30
+  query_proxy_url: ""
+  hosts_yaml_path: "./hosts_505.yaml"
+  include_member_metrics: true
+  top_n: 10
+
+auth_repair:
+  enabled: true
+  browser: "chrome"
+  chrome_executable: "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"
+  profile_dir: "output/auth_profiles/chrome_daily_report"
+  timeout_seconds: 300
+  auto_close: true
+  targets: ["fenxi", "pc_web"]
+  fenxi_url: "https://fenxi.4399dev.com/analysis/"
+  fenxi_probe_urls:
+    - "https://fenxi.4399dev.com/analysis/"
+  pc_login_url: "http://yadmin.4399.com/"
+  pc_probe_urls:
+    - "http://yadmin.4399.com/#/statistics/game-start"
+  pc_chain_candidates: [545]
+
+schedule:
+  auth_prep_time: "08:50"
+  daily_report_time: "09:00"
+  date_mode: "yesterday"
+
 # Optional: publish final report txt to Feishu Doc
 feishu_doc:
   enabled: false

@@ -153,10 +153,22 @@ def _trend_ratio_text(ratio: str) -> str:
     text = ratio.strip()
     if not text:
         return "暂未获取"
+    if text in {"0.00%", "+0.00%", "-0.00%"}:
+        return "持平"
     if text.startswith("+"):
         return f"上涨{text[1:]}"
     if text.startswith("-"):
         return f"下降{text[1:]}"
+    if text.endswith("%"):
+        try:
+            value = float(text[:-1].replace(",", "").strip())
+        except ValueError:
+            return text
+        if abs(value) < 0.005:
+            return "持平"
+        if value > 0:
+            return f"上涨{text}"
+        return f"下降{abs(value):.2f}%"
     return text
 
 
@@ -387,12 +399,20 @@ def _to_date_label(value: str) -> str:
 
 def _load_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
     candidates = [
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/msyhl.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/simsun.ttc",
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Medium.ttc",
         "/Library/Fonts/Arial Unicode.ttf",
     ]
     if bold:
         candidates = [
+            "C:/Windows/Fonts/msyhbd.ttc",
+            "C:/Windows/Fonts/msyh.ttc",
+            "C:/Windows/Fonts/simhei.ttf",
+            "C:/Windows/Fonts/simsunb.ttf",
             "/System/Library/Fonts/PingFang.ttc",
             "/System/Library/Fonts/STHeiti Medium.ttc",
             "/Library/Fonts/Arial Unicode.ttf",

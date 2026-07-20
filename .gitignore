@@ -7,8 +7,9 @@ build/
 dist/
 *.log
 *.jsonl
-autodatareport-cli.spec
-autodatareport-gui.spec
+# PyInstaller recipes are release inputs and belong in version control.
+!autodatareport-cli.spec
+!autodatareport-gui.spec
 
 # Local env
 .venv/

@@ -9,11 +9,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
-from zoneinfo import ZoneInfo
 
 import httpx
 
+from async_utils import gather_limited
 from network_hosts import load_hosts_map, rewrite_url_with_hosts_map
+from tz_compat import get_tzinfo
 
 FENXI_MEDIA_ID = "media-eb40cb50d15a49a9"
 FENXI_TOPIC = "gamebox_event"
@@ -304,6 +305,7 @@ class PCWebSettings:
     hosts_yaml_path: str
     fenxi_base: str = "https://fenxi.4399dev.com"
     timezone: str = "Asia/Shanghai"
+    max_concurrency: int = 4
 
 
 class PCWebMetricsService:
@@ -344,7 +346,24 @@ class PCWebMetricsService:
         if not fenxi_auth:
             return {"ok": False, "message": "PC会员认证信息缺失（fenxi）"}
         try:
-            _ = await self.fetch_member_metrics(query_date=query_date, fenxi_auth=fenxi_auth)
+            offset = self._date_offset(query_date)
+            payload_probe = self._payload_pc_member_total_single(offset)
+            auth_headers = self._auth_headers(fenxi_auth)
+            async with httpx.AsyncClient(
+                timeout=self.settings.request_timeout,
+                follow_redirects=True,
+                proxy=self.settings.query_proxy_url or None,
+                trust_env=False,
+            ) as client:
+                self._apply_auth(client, fenxi_auth)
+                await self._fenxi_module_switch(client, auth_headers)
+                probe_data = await self._fenxi_render_data(client, PC_MEMBER_COMPONENT_TOTAL, payload_probe, auth_headers)
+            _ = self._extract_single_value(
+                probe_data,
+                "d0kojttvygqw",
+                date_field="g0dxf_e30fj1",
+                target_day_key=query_date.strftime("%Y%m%d"),
+            )
             return {"ok": True, "message": "PC会员登录态可用"}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "message": f"PC会员登录态不可用: {exc}"}
@@ -368,11 +387,16 @@ class PCWebMetricsService:
         ) as client:
             self._apply_auth(client, fenxi_auth)
             await self._fenxi_module_switch(client, auth_headers)
-            total_data = await self._fenxi_render_data(client, PC_MEMBER_COMPONENT_TOTAL, payload_total, auth_headers)
-            first_data = await self._fenxi_render_data(client, PC_MEMBER_COMPONENT_FIRST, payload_first, auth_headers)
-            trend_data = await self._fenxi_render_data(client, PC_MEMBER_COMPONENT_TREND, payload_trend, auth_headers)
-            total_today_single = await self._fenxi_render_data(client, PC_MEMBER_COMPONENT_TOTAL, payload_total_today_single, auth_headers)
-            total_week_single = await self._fenxi_render_data(client, PC_MEMBER_COMPONENT_TOTAL, payload_total_week_single, auth_headers)
+            total_data, first_data, trend_data, total_today_single, total_week_single = await gather_limited(
+                [
+                    self._fenxi_render_data(client, PC_MEMBER_COMPONENT_TOTAL, payload_total, auth_headers),
+                    self._fenxi_render_data(client, PC_MEMBER_COMPONENT_FIRST, payload_first, auth_headers),
+                    self._fenxi_render_data(client, PC_MEMBER_COMPONENT_TREND, payload_trend, auth_headers),
+                    self._fenxi_render_data(client, PC_MEMBER_COMPONENT_TOTAL, payload_total_today_single, auth_headers),
+                    self._fenxi_render_data(client, PC_MEMBER_COMPONENT_TOTAL, payload_total_week_single, auth_headers),
+                ],
+                self.settings.max_concurrency,
+            )
 
         notes = self._extract_member_notes(
             total_data=total_data,
@@ -958,10 +982,10 @@ class PCWebMetricsService:
             try:
                 epoch = int(text)
                 if epoch > 10_000_000_000:
-                    dt = datetime.fromtimestamp(epoch / 1000.0, tz=ZoneInfo(self.settings.timezone))
+                    dt = datetime.fromtimestamp(epoch / 1000.0, tz=get_tzinfo(self.settings.timezone))
                     return dt.strftime("%Y%m%d")
                 if epoch > 1_000_000_000:
-                    dt = datetime.fromtimestamp(epoch, tz=ZoneInfo(self.settings.timezone))
+                    dt = datetime.fromtimestamp(epoch, tz=get_tzinfo(self.settings.timezone))
                     return dt.strftime("%Y%m%d")
             except (TypeError, ValueError, OSError):
                 return ""
@@ -1042,7 +1066,7 @@ class PCWebMetricsService:
         return 0
 
     def _date_offset(self, query_date: date) -> int:
-        now_local = datetime.now(ZoneInfo(self.settings.timezone)).date()
+        now_local = datetime.now(get_tzinfo(self.settings.timezone)).date()
         return (query_date - now_local).days
 
     def _query_id(self) -> str:

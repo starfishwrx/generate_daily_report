@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+import unittest
+from datetime import date, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+from report_launcher_gui import ReportLauncherApp
+
+
+class FakeVar:
+    def __init__(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value) -> None:
+        self.value = value
+
+
+class GuiWorkflowTests(unittest.TestCase):
+    def make_app(self) -> ReportLauncherApp:
+        app = ReportLauncherApp.__new__(ReportLauncherApp)
+        app.app_paths = SimpleNamespace(extra_auth=Path("C:/data/extra_auth.json"))
+        app.config_path = Path("C:/data/config.yaml")
+        app.project_root = Path("C:/data")
+        app.date_value = FakeVar((date.today() - timedelta(days=1)).isoformat())
+        app.with_extra = FakeVar(True)
+        app.verify_feishu = FakeVar(False)
+        app.disable_feishu = FakeVar(False)
+        app.auto_auth_recover = FakeVar(True)
+        app.option_summary_text = FakeVar("")
+        app.run_button_text = FakeVar("")
+        app._build_cli_command = lambda *args: ["cli", *args]
+        app._append_auth_repair_args = lambda cmd, target="auto": cmd.append("--repair")
+        return app
+
+    def test_default_summary_describes_one_click_flow(self) -> None:
+        app = self.make_app()
+        app._update_option_summary()
+        self.assertEqual(app.run_button_text.get(), "生成并发送昨天日报")
+        self.assertIn("完整数据", app.option_summary_text.get())
+        self.assertIn("自动发送飞书 / 企微", app.option_summary_text.get())
+        self.assertIn("登录失效自动修复", app.option_summary_text.get())
+
+    def test_generate_only_mode_disables_all_publish_channels(self) -> None:
+        app = self.make_app()
+        app.disable_feishu.set(True)
+        command = app._build_command()
+        self.assertIn("--no-publish", command)
+        self.assertNotIn("--no-push-feishu-doc", command)
+        app._update_option_summary()
+        self.assertEqual(app.run_button_text.get(), "仅生成昨天日报")
+
+    def test_gui_version_is_v12(self) -> None:
+        self.assertEqual(ReportLauncherApp.APP_VERSION, "1.2")
+
+
+if __name__ == "__main__":
+    unittest.main()
