@@ -18,13 +18,14 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import yaml
-from app_paths import ensure_first_run_config, migrate_legacy_runtime_files, resolve_app_paths
+from app_paths import prepare_runtime_config, resolve_app_paths
 from auth_repair import classify_auth_failure
 from browser_auth_refresh import BrowserRefreshSettings, refresh_extra_auth_from_browser
 from autodatareport.gui_runtime import GuiEvent, parse_event_line
 from autodatareport.process_runner import TaskProcessRunner
 from fenxi_auth_from_har import refresh_fenxi_auth_from_hars
 from pc_auth_from_har import refresh_pc_auth_from_hars
+from readiness import ReadinessState, classify_failure, validate_configuration
 
 
 PROGRESS_RE = re.compile(r"\[PROGRESS\]\s*(\d{1,3})\|(.+)")
@@ -34,7 +35,7 @@ FEISHU_PC_URL_RE = re.compile(r"Feishu PC doc published:\s*(https?://\S+)")
 
 class ReportLauncherApp:
     LAUNCHD_LABEL = "com.starfish.autodatareport.daily"
-    APP_VERSION = "1.3"
+    APP_VERSION = "1.4"
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -44,8 +45,7 @@ class ReportLauncherApp:
 
         self.bundle_root = self._resolve_bundle_root()
         self.app_paths = resolve_app_paths()
-        migrate_legacy_runtime_files(self.app_paths)
-        ensure_first_run_config(self.app_paths)
+        self.config_migration = prepare_runtime_config(self.app_paths)
         self.project_root = self.app_paths.data
         self.config_path = self.app_paths.config
         self.script_path = self.bundle_root / "generate_daily_report.py"
@@ -93,6 +93,7 @@ class ReportLauncherApp:
         self.feishu_main_menu_index: Optional[int] = None
         self.feishu_pc_menu_index: Optional[int] = None
         self.option_summary_text = tk.StringVar(value="")
+        self.source_status_text = tk.StringVar(value="平台状态：正在检查配置…")
         self.status_badge: Optional[ttk.Label] = None
         self.log_card: Optional[ttk.Frame] = None
         self.btn_main_doc: Optional[ttk.Button] = None
@@ -104,6 +105,7 @@ class ReportLauncherApp:
         self.date_value.trace_add("write", lambda *_args: self._update_option_summary())
         self._build_ui()
         self._update_option_summary()
+        self._refresh_source_status()
         self._refresh_schedule_status()
         self.root.bind("<Control-Return>", lambda _event: self.start_run())
         self.root.bind("<Escape>", lambda _event: self.stop_run())
@@ -353,6 +355,7 @@ class ReportLauncherApp:
             text="可在右上角“设置与修复”里调整",
             style="Muted.TLabel",
         ).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Label(setup_area, textvariable=self.source_status_text, style="Muted.TLabel").pack(anchor="w", pady=(9, 0))
 
         action_area = ttk.Frame(parent, style="Hero.TFrame")
         action_area.grid(row=0, column=1, sticky="e")
@@ -384,6 +387,9 @@ class ReportLauncherApp:
             return
         tools_menu = tk.Menu(self.tools_menubutton, tearoff=False)
         self.tools_menubutton.configure(menu=tools_menu)
+
+        tools_menu.add_command(label="首次设置（推荐）", command=self.start_first_time_setup)
+        tools_menu.add_separator()
 
         auth_menu = tk.Menu(tools_menu, tearoff=False)
         auth_menu.add_command(label="打开 870 登录页", command=self.open_870_login)
@@ -612,6 +618,16 @@ class ReportLauncherApp:
         action = "仅生成" if self.disable_feishu.get() else "生成并发送"
         self.run_button_text.set(f"{action}{date_label}日报")
 
+    def _refresh_source_status(self) -> None:
+        states = validate_configuration(self._load_config())
+        labels = []
+        for item in states:
+            symbol = "—" if item.state == ReadinessState.DISABLED else ("!" if item.state == ReadinessState.CONFIG_MISSING else "○")
+            labels.append(f"{item.source} {symbol}")
+        missing = any(item.state == ReadinessState.CONFIG_MISSING for item in states)
+        suffix = "（请先点首次设置）" if missing else "（运行时自动验证）"
+        self.source_status_text.set("平台状态：" + "  ".join(labels) + suffix)
+
     def _set_feishu_menu_state(self) -> None:
         if self.document_menu is None:
             return
@@ -829,6 +845,8 @@ class ReportLauncherApp:
                 self.aux_running = False
                 if int(rc) == 0:
                     self._append_log(f"[GUI] {label}完成")
+                    if label == "首次设置":
+                        self.source_status_text.set("平台状态：870 ✓  Fenxi ✓  505 ✓  PC ✓（真实查询已通过）")
                     messagebox.showinfo("完成", f"{label}成功。")
                 else:
                     self._append_log(f"[GUI] {label}失败，退出码={rc}")
@@ -951,19 +969,7 @@ class ReportLauncherApp:
 
     def _looks_like_870_cookie_failure(self) -> bool:
         haystack = self._recent_failure_text()
-        lowered = haystack.lower()
-        markers = [
-            "870 network mode",
-            "抓取870数据",
-            "870登录态不可用",
-            "870登录态预检失败",
-            "admin.buke999.com",
-            "session cookie may be invalid",
-            "session_cookie",
-            "response is not valid json",
-            "phpsessid",
-        ]
-        return any(marker in lowered for marker in markers)
+        return classify_failure(haystack) == ReadinessState.LOGIN_REQUIRED
 
     def _looks_like_auth_failure(self) -> bool:
         haystack = self._recent_failure_text()
@@ -1108,6 +1114,30 @@ class ReportLauncherApp:
             self._append_log("[GUI] 870 PHPSESSID 修复完成，开始自动重试任务")
             self.start_run(from_auto_retry=True)
         return True
+
+    def start_first_time_setup(self) -> None:
+        """Open one guided Chrome session for all logins and verify real platform queries."""
+        cmd = self._build_cli_command(
+            "--config",
+            str(self.config_path),
+            "--date",
+            self.date_value.get().strip(),
+            "--no-runtime-gui",
+            "--with-extra-metrics",
+            "--extra-auth-file",
+            str(self._extra_auth_path()),
+            "--repair-auth-only",
+            "--auth-repair-browser",
+            "chrome",
+            "--auth-repair-profile",
+            str(self.project_root / "output" / "auth_profiles" / "chrome_daily_report"),
+            "--auth-repair-timeout-seconds",
+            "300",
+            "--auth-repair-target",
+            "all",
+        )
+        self.status_text.set("首次设置：请在打开的 Chrome 中依次完成登录")
+        self._run_aux_command("首次设置", cmd)
 
     def start_auth_recovery_and_retry(self) -> None:
         if self._is_busy():

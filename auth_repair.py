@@ -30,8 +30,8 @@ DEFAULT_PC_WEB_ORIGIN = "http://yadmin.4399.com"
 DEFAULT_FENXI_MEDIAIDS = "media-eb40cb50d15a49a9"
 DEFAULT_FENXI_TOPIC = "gamebox_event"
 
-AUTH_REPAIR_TARGETS = {"fenxi", "pc_web"}
-AUTH_REPAIR_TARGET_CHOICES = {"auto", "fenxi", "pc_web", "both"}
+AUTH_REPAIR_TARGETS = {"870", "fenxi", "505", "pc_web"}
+AUTH_REPAIR_TARGET_CHOICES = {"auto", "870", "fenxi", "505", "pc_web", "both", "all"}
 CHAIN_RE = re.compile(r"(?:^|[&?])chain=(\d+)(?:$|[&])")
 
 
@@ -47,6 +47,8 @@ class AuthRepairSettings:
     browser: str = "chrome"
     chrome_executable: str = str(DEFAULT_CHROME_EXE)
     pc_login_url: str = DEFAULT_PC_LOGIN_URL
+    login_url_870: str = ""
+    manage_login_url: str = ""
     pc_probe_urls: Sequence[str] = field(default_factory=lambda: DEFAULT_PC_PROBE_URLS)
     fenxi_url: str = DEFAULT_FENXI_URL
     fenxi_probe_urls: Sequence[str] = field(default_factory=lambda: DEFAULT_FENXI_PROBE_URLS)
@@ -82,7 +84,7 @@ class AgentRepairCoordinator:
         patched_settings = AuthRepairSettings(
             **{
                 **self.settings.__dict__,
-                "target": "both" if set(targets) == AUTH_REPAIR_TARGETS else targets[0],
+                "target": "all" if set(targets) == AUTH_REPAIR_TARGETS else ("both" if set(targets) == {"fenxi", "pc_web"} else targets[0]),
                 "log_path": log_path,
             }
         )
@@ -131,9 +133,10 @@ def classify_auth_failure(text: str) -> Set[str]:
         targets.add("fenxi")
     if any(pattern in lowered for pattern in pc_patterns):
         targets.add("pc_web")
-    if "870登录态" in lowered or "505后台" in lowered or "505登录态" in lowered:
-        if not any(pattern in lowered for pattern in (*fenxi_patterns, *pc_patterns)):
-            return set()
+    if any(pattern in lowered for pattern in ("870登录态", "phpsessid", "session_cookie")):
+        targets.add("870")
+    if "505后台" in lowered or "505登录态" in lowered:
+        targets.add("505")
     return targets
 
 
@@ -142,6 +145,8 @@ def resolve_repair_targets(target: str, reason_text: str = "") -> Set[str]:
     if normalized not in AUTH_REPAIR_TARGET_CHOICES:
         raise AuthRepairError(f"未知认证修复目标: {target}")
     if normalized == "both":
+        return {"fenxi", "pc_web"}
+    if normalized == "all":
         return set(AUTH_REPAIR_TARGETS)
     if normalized in AUTH_REPAIR_TARGETS:
         return {normalized}
@@ -176,6 +181,7 @@ def merge_repaired_auth(
     *,
     fenxi_block: Optional[Dict[str, Any]] = None,
     pc_block: Optional[Dict[str, Any]] = None,
+    manage_block: Optional[Dict[str, Any]] = None,
     browser: str = "chrome",
     pc_chain: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -184,6 +190,8 @@ def merge_repaired_auth(
         payload["fenxi"] = fenxi_block
     if pc_block is not None:
         payload["pc_web"] = pc_block
+    if manage_block is not None:
+        payload["505"] = manage_block
     if "505" not in payload:
         payload["505"] = {"cookies": {}, "headers": {}, "token": "", "bootstrap_url_template": ""}
 
@@ -214,6 +222,10 @@ def recover_auth_with_chrome_profile(settings: AuthRepairSettings) -> Dict[str, 
 
     chrome_exe = resolve_chrome_executable(settings.browser, settings.chrome_executable)
     urls = []
+    if "870" in targets:
+        urls.append(settings.login_url_870)
+    if "505" in targets:
+        urls.append(settings.manage_login_url)
     if "pc_web" in targets:
         urls.extend(_pc_start_urls(settings))
     if "fenxi" in targets:
@@ -229,6 +241,8 @@ def recover_auth_with_chrome_profile(settings: AuthRepairSettings) -> Dict[str, 
     pc_probe_cache: Dict[str, Tuple[bool, str]] = {}
     fenxi_block: Optional[Dict[str, Any]] = None
     pc_block: Optional[Dict[str, Any]] = None
+    manage_block: Optional[Dict[str, Any]] = None
+    session_cookie_870 = ""
     selected_chain: Optional[int] = None
     pc_triggered_chains: Set[int] = set()
     last_pc_diag_at = 0.0
@@ -267,6 +281,21 @@ def recover_auth_with_chrome_profile(settings: AuthRepairSettings) -> Dict[str, 
             last_message = ""
             while time.monotonic() < deadline:
                 cookies = _cookies_from_context(context)
+                if "870" in targets and not session_cookie_870:
+                    cookie_map = _extract_cookies(cookies, _hosts_from_urls(settings.login_url_870))
+                    raw_session = str(cookie_map.get("PHPSESSID") or "").strip()
+                    if raw_session:
+                        session_cookie_870 = f"PHPSESSID={raw_session}"
+                if "505" in targets and manage_block is None:
+                    manage_cookies = _extract_cookies(cookies, _hosts_from_urls(settings.manage_login_url))
+                    if manage_cookies:
+                        existing_manage = existing.get("505") if isinstance(existing.get("505"), dict) else {}
+                        manage_block = {
+                            "cookies": manage_cookies,
+                            "headers": dict(existing_manage.get("headers") or {}),
+                            "token": str(existing_manage.get("token") or ""),
+                            "bootstrap_url_template": str(existing_manage.get("bootstrap_url_template") or ""),
+                        }
                 storage_entries = _pc_storage_entries(context, settings) if "pc_web" in targets else {}
                 storage_admin_token = _extract_admin_token_from_storage(storage_entries)
                 pc_cookie_names = sorted(_extract_cookies(cookies, ("yadmin.4399.com", "yapiadmin.4399.com")).keys())
@@ -325,13 +354,17 @@ def recover_auth_with_chrome_profile(settings: AuthRepairSettings) -> Dict[str, 
                     else:
                         last_message = message
 
-                if ("fenxi" not in targets or fenxi_block is not None) and (
-                    "pc_web" not in targets or pc_block is not None
+                if (
+                    ("870" not in targets or bool(session_cookie_870))
+                    and ("fenxi" not in targets or fenxi_block is not None)
+                    and ("505" not in targets or manage_block is not None)
+                    and ("pc_web" not in targets or pc_block is not None)
                 ):
                     payload = merge_repaired_auth(
                         existing,
                         fenxi_block=fenxi_block,
                         pc_block=pc_block,
+                        manage_block=manage_block,
                         browser=settings.browser,
                         pc_chain=selected_chain,
                     )
@@ -340,6 +373,7 @@ def recover_auth_with_chrome_profile(settings: AuthRepairSettings) -> Dict[str, 
                         "ok": True,
                         "output_path": str(settings.output),
                         "updated_targets": sorted(targets),
+                        "session_cookie_870": session_cookie_870,
                         "pc_chain": selected_chain,
                         "fenxi_message": inspect_fenxi_token(fenxi_block or {}).get("reason") if fenxi_block else "",
                     }
@@ -560,6 +594,15 @@ def _extract_cookies(cookies: Sequence[Dict[str, Any]], domains: Iterable[str]) 
         if name and value:
             out[name] = value
     return out
+
+
+def _hosts_from_urls(*urls: str) -> Tuple[str, ...]:
+    hosts: List[str] = []
+    for value in urls:
+        host = str(urllib.parse.urlparse(str(value or "")).hostname or "").strip().lower()
+        if host and host not in hosts:
+            hosts.append(host)
+    return tuple(hosts)
 
 
 def _pc_admin_token_from_cookies(cookies: Sequence[Dict[str, Any]]) -> str:

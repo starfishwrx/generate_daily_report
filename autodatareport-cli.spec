@@ -24,11 +24,16 @@ def _collect_sqlite_binary():
             return [(str(candidate), ".")]
     return []
 
+
+def _collect_internal_defaults():
+    root = Path("build/internal")
+    return [(str(path), "internal_defaults") for path in root.glob("*") if path.is_file()]
+
 a = Analysis(
     ['generate_daily_report.py'],
     pathex=[],
     binaries=_collect_sqlite_binary() + matplotlib_binaries,
-    datas=[('templates', 'templates'), ('scripts', 'scripts'), ('config.example.yaml', '.'), ('hosts_870.example.yaml', '.'), ('hosts_505.example.yaml', '.'), ('extra_auth.example.json', '.')] + matplotlib_datas,
+    datas=[('templates', 'templates'), ('scripts', 'scripts'), ('config.example.yaml', '.'), ('hosts_870.example.yaml', '.'), ('hosts_505.example.yaml', '.'), ('extra_auth.example.json', '.')] + _collect_internal_defaults() + matplotlib_datas,
     hiddenimports=['websockets', 'sqlite3', '_sqlite3', 'playwright.sync_api'] + matplotlib_hiddenimports,
     hookspath=[],
     hooksconfig={},

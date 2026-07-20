@@ -29,7 +29,7 @@ import requests
 import yaml
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from app_paths import ensure_first_run_config, migrate_legacy_runtime_files, resolve_app_paths
+from app_paths import prepare_runtime_config, resolve_app_paths
 from dateutil import parser as date_parser
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from auth_repair import AgentRepairCoordinator, AuthRepairSettings, classify_auth_failure
@@ -356,7 +356,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--auth-repair-target",
-        choices=["auto", "fenxi", "pc_web", "both"],
+        choices=["auto", "870", "fenxi", "505", "pc_web", "both", "all"],
         default=None,
         help="Auth repair target. auto infers from the failure; no-failure repair defaults to both.",
     )
@@ -1120,6 +1120,8 @@ def resolve_auth_repair_settings(
             or r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
         ).strip(),
         pc_login_url=str(auth_cfg.get("pc_login_url") or pc_web_cfg.get("web_origin") or "http://yadmin.4399.com/").strip(),
+        login_url_870=str(config.get("login_url_870") or config.get("base_url") or "").strip(),
+        manage_login_url=str(auth_cfg.get("manage_login_url") or extra_metrics_cfg.get("manage_base") or "").strip(),
         pc_probe_urls=[str(value).strip() for value in pc_probe_urls if str(value).strip()],
         fenxi_url=str(auth_cfg.get("fenxi_url") or "https://fenxi.4399dev.com/analysis/").strip(),
         fenxi_probe_urls=[str(value).strip() for value in fenxi_probe_urls if str(value).strip()],
@@ -1179,8 +1181,23 @@ def run_auth_repair(
         result = coordinator.run(reason_text=reason_text)
     except Exception as exc:  # noqa: BLE001
         raise ReportError(f"登录态自动修复失败: {exc}") from exc
-    logging.info("认证自动修复完成: targets=%s log=%s", ",".join(result.get("updated_targets") or []), result.get("log_path", ""))
+    cookie_870 = str(result.get("session_cookie_870") or "").strip()
+    if cookie_870:
+        config["session_cookie"] = cookie_870
+        Path(args.config).write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    logging.info("认证自动修复采集完成: targets=%s log=%s", ",".join(result.get("updated_targets") or []), result.get("log_path", ""))
     return result
+
+
+def select_auth_repair_target(targets: Sequence[str]) -> str:
+    target_set = set(targets)
+    if target_set == {"fenxi", "pc_web"}:
+        return "both"
+    if target_set == {"870", "fenxi", "505", "pc_web"}:
+        return "all"
+    if targets:
+        return str(targets[0])
+    return "auto"
 
 
 def run_full_auth_preflight_with_repair(
@@ -1212,7 +1229,7 @@ def run_full_auth_preflight_with_repair(
         emit_progress(9, "登录态失效，打开 Chrome 修复窗口")
         original_repair_target = args.auth_repair_target
         if str(args.auth_repair_target or "auto").strip().lower() == "auto":
-            args.auth_repair_target = "both"
+            args.auth_repair_target = select_auth_repair_target(repair_targets)
         try:
             result = run_auth_repair(config, args, extra_metrics_cfg, extra_auth_file, reason_text=reason_text)
         except ReportError as repair_exc:
@@ -2992,10 +3009,9 @@ def _prepare_runtime_paths(args: argparse.Namespace) -> None:
             args.output = paths.output
         if Path(args.extra_auth_file) == DEFAULT_EXTRA_AUTH_FILE:
             args.extra_auth_file = paths.extra_auth
-    migrated = migrate_legacy_runtime_files(paths)
-    ensure_first_run_config(paths)
-    for path in migrated:
-        logging.info("Migrated legacy runtime file to user data directory: %s", path)
+    migration = prepare_runtime_config(paths)
+    if migration.changed:
+        logging.info("V1.4 runtime configuration migrated: %s", migration.message)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -3185,7 +3201,7 @@ def run_with_args(args: argparse.Namespace) -> None:
             return
 
     if args.repair_auth_only:
-        emit_progress(20, "打开 Chrome 修复 fenxi/PC 登录态")
+        emit_progress(20, "打开 Chrome 完成四平台首次登录")
         result = run_auth_repair(config, args, extra_metrics_cfg, extra_auth_file)
         report_date_for_state = resolve_report_date(args.date)
         write_run_state(
@@ -3199,9 +3215,11 @@ def run_with_args(args: argparse.Namespace) -> None:
                 "auth_repair_log": result.get("log_path", ""),
             },
         )
-        logging.info("fenxi/PC 登录态修复已完成；repair-only 不执行 870/505 全平台预检。")
-        write_run_state(Path(args.output), report_date_for_state, {"preflight_result": "skipped_for_repair_only"})
-        emit_progress(100, "认证修复完成")
+        emit_progress(80, "验证四个平台是否真正可用")
+        run_full_auth_preflight(config, args, extra_metrics_cfg, extra_auth_file)
+        logging.info("四平台登录采集及真实接口预检均已通过。")
+        write_run_state(Path(args.output), report_date_for_state, {"preflight_result": "ok"})
+        emit_progress(100, "首次设置完成，四平台均已就绪")
         return
 
     if args.check_extra_auth:

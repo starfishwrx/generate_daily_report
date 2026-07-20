@@ -1,8 +1,8 @@
 @echo off
 setlocal
 
-set "APP_VERSION=1.3.0"
-set "RELEASE_DIR=dist\windows-release-v1.3.0"
+set "APP_VERSION=1.4.0"
+set "RELEASE_DIR=dist\windows-release-v1.4.0"
 
 where uv >nul 2>&1
 if errorlevel 1 (
@@ -15,7 +15,7 @@ uv sync --frozen --group build
 if errorlevel 1 goto :fail
 set "PYTHON_EXE=%CD%\.venv\Scripts\python.exe"
 
-echo Cleaning previous V1.3 build output...
+echo Cleaning previous V1.4 build output...
 if exist "%RELEASE_DIR%" rmdir /s /q "%RELEASE_DIR%"
 if exist "%RELEASE_DIR%" (
     echo Failed to clean %RELEASE_DIR%. Close running EXE files and try again.
@@ -40,6 +40,15 @@ if exist build\autodatareport-gui rmdir /s /q build\autodatareport-gui
 if exist build\autodatareport-gui (
     echo Failed to clean build\autodatareport-gui.
     goto :fail
+)
+
+if exist build\internal rmdir /s /q build\internal
+if defined AUTODATAREPORT_INTERNAL_CONFIG (
+    echo Preparing sanitized internal platform defaults...
+    %PYTHON_EXE% scripts\prepare_internal_defaults.py "%AUTODATAREPORT_INTERNAL_CONFIG%" build\internal
+    if errorlevel 1 goto :fail
+) else (
+    echo Public build: AUTODATAREPORT_INTERNAL_CONFIG is not set.
 )
 
 echo Building CLI executable...

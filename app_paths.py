@@ -105,3 +105,12 @@ def ensure_first_run_config(paths: AppPaths) -> Path:
             shutil.copy2(source, paths.config)
             return paths.config
     return paths.config
+
+
+def prepare_runtime_config(paths: AppPaths):
+    """Create/migrate runtime files, then apply optional internal distribution defaults."""
+    migrate_legacy_runtime_files(paths)
+    ensure_first_run_config(paths)
+    from config_migration import migrate_internal_config
+
+    return migrate_internal_config(paths)

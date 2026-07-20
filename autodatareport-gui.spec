@@ -24,11 +24,16 @@ def _collect_sqlite_binary():
             return [(str(candidate), ".")]
     return []
 
+
+def _collect_internal_defaults():
+    root = Path("build/internal")
+    return [(str(path), "internal_defaults") for path in root.glob("*") if path.is_file()]
+
 a = Analysis(
     ['report_launcher_gui.py'],
     pathex=[],
     binaries=_collect_sqlite_binary() + matplotlib_binaries,
-    datas=[('generate_daily_report.py', '.'), ('auth_repair.py', '.'), ('browser_auth_refresh.py', '.'), ('fenxi_auth_from_har.py', '.'), ('pc_auth_from_har.py', '.'), ('auth_recovery_playwright.py', '.'), ('templates', 'templates'), ('scripts', 'scripts'), ('config.example.yaml', '.'), ('hosts_870.example.yaml', '.'), ('hosts_505.example.yaml', '.'), ('extra_auth.example.json', '.')] + matplotlib_datas,
+    datas=[('generate_daily_report.py', '.'), ('auth_repair.py', '.'), ('browser_auth_refresh.py', '.'), ('fenxi_auth_from_har.py', '.'), ('pc_auth_from_har.py', '.'), ('auth_recovery_playwright.py', '.'), ('templates', 'templates'), ('scripts', 'scripts'), ('config.example.yaml', '.'), ('hosts_870.example.yaml', '.'), ('hosts_505.example.yaml', '.'), ('extra_auth.example.json', '.')] + _collect_internal_defaults() + matplotlib_datas,
     hiddenimports=['sqlite3', '_sqlite3', 'playwright.sync_api'] + matplotlib_hiddenimports,
     hookspath=[],
     hooksconfig={},
