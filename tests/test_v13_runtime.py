@@ -12,13 +12,13 @@ from unittest import mock
 
 import httpx
 
-from async_utils import RetryingAsyncClient
+from async_utils import RetryingAsyncClient, gather_limited, request_budget
 from autodatareport.cache import ArtifactCache, hash_payload
 from autodatareport.events import JsonlEventSink, RunMetricsRecorder
 from autodatareport.gui_runtime import parse_event_line
 from autodatareport.models import StageEvent
 from autodatareport.pipeline import SourceTask, run_source_tasks
-from feishu_doc import FeishuDocSettings
+from feishu_doc import FeishuDocError, FeishuDocSettings
 from generate_daily_report import (
     FeishuPublishJob,
     MetricSummary,
@@ -105,6 +105,40 @@ class CacheAndPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(calls, 2)
 
+    async def test_request_budget_one_limits_nested_batches_without_deadlock(self) -> None:
+        active = 0
+        peak = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return httpx.Response(200, request=request)
+
+        async with RetryingAsyncClient(
+            transport=httpx.MockTransport(handler),
+            request_retries=0,
+        ) as client:
+            with request_budget(1):
+                response_groups = await asyncio.wait_for(
+                    gather_limited(
+                        [
+                            gather_limited(
+                                [client.get(f"https://example.test/{group}/{index}") for index in range(2)],
+                                limit=2,
+                            )
+                            for group in range(2)
+                        ],
+                        limit=2,
+                    ),
+                    timeout=2,
+                )
+        responses = [response for group in response_groups for response in group]
+        self.assertEqual([response.status_code for response in responses], [200, 200, 200, 200])
+        self.assertEqual(peak, 1)
+
     async def test_source_tasks_run_concurrently_and_preserve_errors(self) -> None:
         active = 0
         peak = 0
@@ -176,11 +210,37 @@ class PublishConcurrencyTests(unittest.TestCase):
 
         with mock.patch("generate_daily_report.fetch_tenant_access_token", return_value="shared") as token_mock:
             with mock.patch("generate_daily_report.publish_report_to_feishu_doc", side_effect=fake_publish) as publish_mock:
-                results = publish_feishu_jobs(settings, [job("main"), job("pc")])
+                batch = publish_feishu_jobs(settings, [job("main"), job("pc")])
         token_mock.assert_called_once_with(settings)
         self.assertEqual(publish_mock.call_count, 2)
-        self.assertEqual(results["main"][0]["url"], "https://example.test/main")
+        self.assertEqual(batch.results["main"][0]["url"], "https://example.test/main")
+        self.assertEqual(batch.errors, {})
         self.assertTrue(all(call.kwargs["tenant_access_token"] == "shared" for call in publish_mock.call_args_list))
+
+    def test_partial_publish_keeps_each_success_and_failure(self) -> None:
+        settings = FeishuDocSettings(app_id="id", app_secret="secret")
+
+        def job(target: str) -> FeishuPublishJob:
+            return FeishuPublishJob(
+                target=target,
+                report_text=target,
+                report_date=date(2026, 7, 19),
+                title_override="",
+                title_prefix=target,
+                report_base_dir=Path("."),
+                chart_image_paths={},
+            )
+
+        def fake_publish(**kwargs):
+            if kwargs["report_text"] == "pc":
+                raise FeishuDocError("pc failed")
+            return {"url": "https://example.test/main"}
+
+        with mock.patch("generate_daily_report.fetch_tenant_access_token", return_value="shared"):
+            with mock.patch("generate_daily_report.publish_report_to_feishu_doc", side_effect=fake_publish):
+                batch = publish_feishu_jobs(settings, [job("main"), job("pc")])
+        self.assertEqual(batch.results["main"][0]["url"], "https://example.test/main")
+        self.assertIsInstance(batch.errors["pc"], FeishuDocError)
 
 
 if __name__ == "__main__":

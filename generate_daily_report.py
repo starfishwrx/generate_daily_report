@@ -2696,7 +2696,8 @@ def collect_870_stage(context: RunContext, args: argparse.Namespace, cookie: str
         )
 
     total_targets = max(1, len(configured_keys))
-    max_workers = min(args.max_concurrency, 4, total_targets)
+    allocated_workers = int(context.shared.get("870_worker_limit") or args.max_concurrency)
+    max_workers = min(args.max_concurrency, allocated_workers, 4, total_targets)
     emit_progress(15, f"并发抓取870数据（上限 {max_workers}）")
     unordered: Dict[str, TargetResult] = {}
     try:
@@ -2888,14 +2889,26 @@ async def collect_daily_sources(
     pc_web_cfg: Dict[str, Any],
     timeout: float,
 ) -> Dict[str, Any]:
+    extra_enabled = bool(args.with_extra_metrics or extra_metrics_cfg.get("enabled"))
+    pc_enabled = bool(pc_web_cfg.get("enabled"))
+    has_async_sources = extra_enabled or pc_enabled
+    total_limit = max(1, int(args.max_total_concurrency))
+    desired_870_workers = min(max(1, int(args.max_concurrency)), 4)
+    if has_async_sources and total_limit > 1:
+        reserved_870_workers = min(desired_870_workers, total_limit - 1)
+    else:
+        reserved_870_workers = min(desired_870_workers, total_limit)
+    context.shared["870_worker_limit"] = max(1, reserved_870_workers)
+
     tasks = [SourceTask("870", lambda: asyncio.to_thread(collect_870_stage, context, args, cookie))]
-    if bool(args.with_extra_metrics or extra_metrics_cfg.get("enabled")):
+    if extra_enabled:
         tasks.append(SourceTask("extra", lambda: collect_extra_stage(context, args, extra_metrics_cfg, timeout), strict=False))
-    if bool(pc_web_cfg.get("enabled")):
+    if pc_enabled:
         tasks.append(SourceTask("pc", lambda: collect_pc_stage(context, args, extra_metrics_cfg, pc_web_cfg)))
-    async_request_limit = max(1, int(args.max_total_concurrency) - min(int(args.max_concurrency), 4))
+    async_request_limit = max(1, total_limit - reserved_870_workers)
+    max_active_sources = 1 if total_limit == 1 else 3
     with request_budget(async_request_limit):
-        batch = await run_source_tasks(tasks, max_active_sources=3)
+        batch = await run_source_tasks(tasks, max_active_sources=max_active_sources)
     extra_error = batch.errors.pop("extra", None)
     if extra_error is not None:
         warning = f"扩展指标请求失败: {extra_error}"
@@ -2925,20 +2938,20 @@ class FeishuPublishJob:
     payment_images: Dict[str, str] = field(default_factory=dict)
 
 
-class FeishuPublishJobError(FeishuDocError):
-    def __init__(self, target: str, cause: FeishuDocError) -> None:
-        super().__init__(str(cause))
-        self.target = target
+@dataclass
+class FeishuPublishBatchResult:
+    results: Dict[str, Tuple[Dict[str, str], float]] = field(default_factory=dict)
+    errors: Dict[str, Exception] = field(default_factory=dict)
 
 
 def publish_feishu_jobs(
     settings: FeishuDocSettings,
     jobs: Sequence[FeishuPublishJob],
-) -> Dict[str, Tuple[Dict[str, str], float]]:
+) -> FeishuPublishBatchResult:
     """Publish independent documents concurrently with one tenant token."""
 
     if not jobs:
-        return {}
+        return FeishuPublishBatchResult()
     token = fetch_tenant_access_token(settings)
 
     def publish(job: FeishuPublishJob) -> Tuple[Dict[str, str], float]:
@@ -2958,16 +2971,16 @@ def publish_feishu_jobs(
         return result, monotonic_time.perf_counter() - started
 
     worker_count = min(2, len(jobs))
-    results: Dict[str, Tuple[Dict[str, str], float]] = {}
+    batch = FeishuPublishBatchResult()
     with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="feishu-doc") as executor:
         futures = {executor.submit(publish, job): job.target for job in jobs}
         for future in as_completed(futures):
             target = futures[future]
             try:
-                results[target] = future.result()
-            except FeishuDocError as exc:
-                raise FeishuPublishJobError(target, exc) from exc
-    return results
+                batch.results[target] = future.result()
+            except Exception as exc:  # Keep successful sibling documents idempotent.
+                batch.errors[target] = exc
+    return batch
 
 
 def _prepare_runtime_paths(args: argparse.Namespace) -> None:
@@ -3067,9 +3080,6 @@ def run_with_args(args: argparse.Namespace) -> None:
             logging.info("Feishu doc published: %s", feishu_result.get("url", ""))
             if feishu_result.get("markdown_length"):
                 logging.info("Feishu doc markdown length: %s", feishu_result.get("markdown_length"))
-        except FeishuPublishJobError as exc:
-            label = "PC飞书文档" if exc.target == "pc" else "飞书文档"
-            raise ReportError(f"{label}推送失败: {exc}") from exc
         except FeishuDocError as exc:
             raise ReportError(f"飞书文档推送失败: {exc}") from exc
         emit_progress(100, "推送完成")
@@ -3406,11 +3416,8 @@ def run_with_args(args: argparse.Namespace) -> None:
                     )
                 )
 
-        try:
-            publish_results = publish_feishu_jobs(feishu_settings, publish_jobs)
-        except FeishuDocError as exc:
-            raise ReportError(f"飞书文档推送失败: {exc}") from exc
-        for target, (result, elapsed) in publish_results.items():
+        publish_batch = publish_feishu_jobs(feishu_settings, publish_jobs)
+        for target, (result, elapsed) in publish_batch.results.items():
             url = str(result.get("url") or "").strip()
             state_key = f"feishu_{target}"
             publish_store.mark_completed(state_key, publish_hashes[target], {"url": url})
@@ -3429,6 +3436,10 @@ def run_with_args(args: argparse.Namespace) -> None:
                 feishu_main_url = url
             if result.get("markdown_length"):
                 logging.info("Feishu%s doc markdown length: %s", " PC" if target == "pc" else "", result.get("markdown_length"))
+        if publish_batch.errors:
+            failed_target, error = next(iter(publish_batch.errors.items()))
+            label = "PC日报" if failed_target == "pc" else "主日报"
+            raise ReportError(f"飞书{label}推送失败: {error}") from error
 
     if should_push_wecom_bot(config, args):
         auto_targets = resolve_wecom_auto_targets(config)

@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 TOKEN_RE = re.compile(r"access_token=([^&\"'\s<>]+)")
 
@@ -52,6 +52,44 @@ def _decode_jwt_payload(token: str) -> Optional[Dict[str, Any]]:
     return payload
 
 
+def _successful_har_entry(entry: Dict[str, Any]) -> bool:
+    try:
+        status = int(entry.get("response", {}).get("status"))
+    except (TypeError, ValueError):
+        return False
+    return 200 <= status < 400
+
+
+def _har_entry_matches_platform(entry: Dict[str, Any], platform: str) -> bool:
+    request = entry.get("request", {})
+    request_url = str(request.get("url") or "")
+    urls = [request_url]
+    for header in entry.get("response", {}).get("headers", []):
+        if str(header.get("name") or "").lower() == "location":
+            urls.append(str(header.get("value") or ""))
+
+    normalized_urls = [(value, urlsplit(unquote(value))) for value in urls if value]
+    if platform == "fenxi":
+        return any(
+            item.hostname == "fenxi.4399dev.com"
+            or "/event-analysis-server/" in item.path
+            or "qz4399doc" in unquote(value).lower()
+            for value, item in normalized_urls
+        )
+    if platform == "pc_web":
+        return any(item.hostname in {"yapiadmin.4399.com", "yadmin.4399.com"} for _, item in normalized_urls)
+    if platform == "505":
+        request_cookie_names = {
+            str(cookie.get("name") or "").lower() for cookie in request.get("cookies", [])
+        }
+        return (
+            any("manage505" in unquote(value).lower() for value in urls)
+            or any(item.path.startswith("/pay/") for _, item in normalized_urls)
+            or any(name.startswith("__manage_") for name in request_cookie_names)
+        )
+    return False
+
+
 def _collect_auth_data(har_paths: Iterable[Path], platform: str) -> Dict[str, Any]:
     cookies: Dict[str, str] = {}
     headers: Dict[str, str] = {}
@@ -85,6 +123,8 @@ def _collect_auth_data(har_paths: Iterable[Path], platform: str) -> Dict[str, An
     for path in har_paths:
         data = json.loads(path.read_text(encoding="utf-8"))
         for entry in data.get("log", {}).get("entries", []):
+            if not _successful_har_entry(entry) or not _har_entry_matches_platform(entry, platform):
+                continue
             req = entry.get("request", {})
             req_url = str(req.get("url") or "")
             req_headers = {str(h.get("name", "")): str(h.get("value", "")) for h in req.get("headers", [])}
@@ -182,21 +222,11 @@ def _collect_auth_data(har_paths: Iterable[Path], platform: str) -> Dict[str, An
     else:
         platform_hint = ""
 
-    token = ""
-    for cand in token_candidates:
-        if platform_hint and platform_hint in cand:
-            token = cand
-            break
-    if not token and token_candidates:
-        token = token_candidates[0]
+    matching_tokens = [cand for cand in token_candidates if platform_hint and platform_hint in cand]
+    token = matching_tokens[-1] if matching_tokens else (token_candidates[-1] if token_candidates else "")
 
-    bootstrap_url = ""
-    for cand in bootstrap_candidates:
-        if token and token in cand:
-            bootstrap_url = cand
-            break
-    if not bootstrap_url and bootstrap_candidates:
-        bootstrap_url = bootstrap_candidates[0]
+    matching_bootstrap = [cand for cand in bootstrap_candidates if token and token in cand]
+    bootstrap_url = matching_bootstrap[-1] if matching_bootstrap else (bootstrap_candidates[-1] if bootstrap_candidates else "")
 
     if token and bootstrap_url:
         bootstrap_url = bootstrap_url.replace(token, "{access_token}")

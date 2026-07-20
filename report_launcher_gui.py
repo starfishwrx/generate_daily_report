@@ -926,7 +926,7 @@ class ReportLauncherApp:
         proc = self.process
         self._append_log(f"[GUI] 为执行“{label}”，先停止当前任务")
         try:
-            proc.terminate()
+            self.process_runner.terminate(proc)
             try:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:

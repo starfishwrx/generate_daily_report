@@ -29,7 +29,15 @@ class RetryingAsyncClient(httpx.AsyncClient):
     async def request(self, method: str, url: httpx.URL | str, *args, **kwargs) -> httpx.Response:
         for attempt in range(1, self.request_retries + 1):
             try:
-                response = await super().request(method, url, *args, **kwargs)
+                global_semaphore = _GLOBAL_SEMAPHORE.get()
+                if global_semaphore is None:
+                    response = await super().request(method, url, *args, **kwargs)
+                else:
+                    # Acquire the shared budget at the actual I/O boundary.  Holding it
+                    # around a higher-level coroutine can deadlock when that coroutine
+                    # starts another gather_limited() batch.
+                    async with global_semaphore:
+                        response = await super().request(method, url, *args, **kwargs)
             except (httpx.TimeoutException, httpx.TransportError):
                 if attempt >= self.request_retries:
                     raise
@@ -68,10 +76,6 @@ async def gather_limited(awaitables: Iterable[Awaitable[T]], limit: int = 4) -> 
 
     async def run(item: Awaitable[T]) -> T:
         async with semaphore:
-            global_semaphore = _GLOBAL_SEMAPHORE.get()
-            if global_semaphore is None:
-                return await item
-            async with global_semaphore:
-                return await item
+            return await item
 
     return list(await asyncio.gather(*(run(item) for item in awaitables)))
