@@ -15,6 +15,9 @@ class GuiEvent:
     url: str = ""
     path: str = ""
     metrics_path: str = ""
+    failure_kind: str = ""
+    failure_source: str = ""
+    error_type: str = ""
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "GuiEvent":
@@ -30,6 +33,9 @@ class GuiEvent:
             url=str(detail_map.get("url") or ""),
             path=str(detail_map.get("path") or ""),
             metrics_path=str(detail_map.get("metrics_path") or ""),
+            failure_kind=str(detail_map.get("failure_kind") or ""),
+            failure_source=str(detail_map.get("failure_source") or ""),
+            error_type=str(detail_map.get("error_type") or ""),
         )
 
     def log_line(self) -> str:

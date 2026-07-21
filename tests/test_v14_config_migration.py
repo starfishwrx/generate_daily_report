@@ -70,7 +70,7 @@ def test_internal_defaults_replace_placeholders_and_preserve_personal_state(tmp_
     assert migrated["base_url"] == "http://870.internal/?m=sdk"
     assert migrated["session_cookie"] == "PHPSESSID=user-cookie"
     assert migrated["feishu_doc"]["app_id"] == "personal"
-    assert migrated["config_schema_version"] == "1.4"
+    assert migrated["config_schema_version"] == "1.5"
 
     second = migrate_internal_config(paths)
     assert second.changed is False
@@ -117,3 +117,33 @@ def test_known_870_endpoint_is_upgraded_to_https() -> None:
     normalized = normalize_company_endpoints(config)
     assert normalized["base_url"].startswith("https://")
     assert normalized["login_url_870"] == "https://admin.buke999.com"
+
+
+def test_migration_preserves_unknown_user_fields_and_reports_changed_paths(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    internal_dir = paths.bundle / "internal_defaults"
+    internal_dir.mkdir()
+    (internal_dir / "company-defaults.yaml").write_text(
+        yaml.safe_dump(_internal_defaults(), sort_keys=False), encoding="utf-8"
+    )
+    paths.config.write_text(
+        yaml.safe_dump(
+            {
+                "base_url": "http://old.internal",
+                "custom_plugin": {"keep": True},
+                "extra_metrics": {"enabled": False, "personal_note": "保留我"},
+            },
+            sort_keys=False,
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+
+    result = migrate_internal_config(paths)
+    migrated = yaml.safe_load(paths.config.read_text(encoding="utf-8"))
+
+    assert migrated["custom_plugin"] == {"keep": True}
+    assert migrated["extra_metrics"]["personal_note"] == "保留我"
+    assert migrated["extra_metrics"]["enabled"] is True
+    assert "base_url" in result.changed_paths
+    assert "extra_metrics.enabled" in result.changed_paths

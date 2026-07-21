@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from autodatareport.atomic_io import atomic_write_json
+
 
 class AuthRecoveryError(RuntimeError):
     """Raised when interactive auth recovery fails."""
@@ -416,7 +418,7 @@ def recover_auth(settings: RecoverySettings) -> Dict[str, Any]:
     payload["meta"] = updated_meta
 
     settings.output.parent.mkdir(parents=True, exist_ok=True)
-    settings.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(settings.output, payload)
     return {
         "output_path": str(settings.output),
         "pc_updated": pc_updated,

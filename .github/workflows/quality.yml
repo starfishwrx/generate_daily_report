@@ -1,0 +1,25 @@
+name: quality
+
+on:
+  push:
+    branches: [main, "codex/**"]
+  pull_request:
+
+jobs:
+  windows-quality:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync locked dependencies
+        run: uv sync --frozen --group dev
+      - name: Ruff
+        run: uv run python -m ruff check .
+      - name: Tests
+        run: uv run python -m pytest -q
+      - name: Compile
+        run: uv run python -m compileall -q .
+      - name: Dependency audit
+        run: uv run python -m pip_audit

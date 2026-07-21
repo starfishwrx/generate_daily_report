@@ -4,12 +4,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date
 import mimetypes
+import random
 import re
 import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from autodatareport.events import current_metrics
@@ -73,10 +74,11 @@ def _request_with_retry(
     timeout: int,
     request_retries: int,
     retry_backoff_seconds: float,
+    safe_to_retry: bool = False,
     **kwargs: Any,
 ) -> requests.Response:
     last_exc: Optional[requests.RequestException] = None
-    attempts = max(1, int(request_retries))
+    attempts = max(1, int(request_retries)) if safe_to_retry or method.upper() in {"GET", "HEAD"} else 1
     backoff = max(0.0, float(retry_backoff_seconds))
     for attempt in range(1, attempts + 1):
         _rewind_files(kwargs.get("files"))
@@ -95,9 +97,14 @@ def _request_with_retry(
             if retryable_status and attempt < attempts:
                 if metrics is not None:
                     metrics.increment("retries")
+                retry_after = str(response.headers.get("Retry-After", "") or "").strip()
                 response.close()
                 if backoff > 0:
-                    time.sleep(backoff * attempt)
+                    try:
+                        delay = max(0.0, float(retry_after)) if retry_after else backoff * attempt
+                    except (TypeError, ValueError):
+                        delay = backoff * attempt
+                    time.sleep(delay + random.uniform(0.0, min(0.25, delay * 0.1)))
                 continue
             return response
         except requests.RequestException as exc:
@@ -107,7 +114,8 @@ def _request_with_retry(
             if metrics is not None:
                 metrics.increment("retries")
             if backoff > 0:
-                time.sleep(backoff * attempt)
+                delay = backoff * attempt
+                time.sleep(delay + random.uniform(0.0, min(0.25, delay * 0.1)))
     raise FeishuDocError(
         f"HTTP request failed after {attempts} attempts: {last_exc}"
     )
@@ -149,6 +157,7 @@ def _fetch_tenant_access_token(settings: FeishuDocSettings) -> str:
         timeout=settings.timeout,
         request_retries=settings.request_retries,
         retry_backoff_seconds=settings.retry_backoff_seconds,
+        safe_to_retry=True,
         json={"app_id": settings.app_id, "app_secret": settings.app_secret},
     )
     payload = _safe_json(response)
@@ -805,10 +814,21 @@ def publish_report_to_feishu_doc(
     payment_images: Optional[Dict[str, str]] = None,
     tenant_access_token: str = "",
     image_upload_concurrency: int = 3,
+    on_publish_started: Optional[Callable[[], None]] = None,
+    on_document_created: Optional[Callable[[Dict[str, str]], None]] = None,
 ) -> Dict[str, str]:
     token = tenant_access_token.strip() or _fetch_tenant_access_token(settings)
     title = _build_document_title(report_date=report_date, title_override=title_override, title_prefix=title_prefix)
+    if on_publish_started is not None:
+        on_publish_started()
     document_id = _create_document(settings=settings, token=token, title=title)
+    initial_result = {
+        "document_id": document_id,
+        "title": title,
+        "url": _build_document_url(settings.doc_url_prefix, document_id),
+    }
+    if on_document_created is not None:
+        on_document_created(initial_result)
     blocks = _list_blocks(settings=settings, token=token, document_id=document_id)
     root_block_id = _resolve_root_block_id(document_id=document_id, blocks=blocks)
     base_dir = (report_base_dir or Path.cwd()).resolve()
@@ -895,11 +915,7 @@ def publish_report_to_feishu_doc(
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="feishu-image") as executor:
                 for future in [executor.submit(publish_image, job) for job in image_jobs]:
                     future.result()
-    out = {
-        "document_id": document_id,
-        "title": title,
-        "url": _build_document_url(settings.doc_url_prefix, document_id),
-    }
+    out = dict(initial_result)
     if settings.verify_content_after_publish:
         content = _fetch_doc_markdown_content(settings=settings, token=token, document_id=document_id)
         out["markdown_length"] = str(len(content))

@@ -21,11 +21,15 @@ import yaml
 from app_paths import prepare_runtime_config, resolve_app_paths
 from auth_repair import classify_auth_failure
 from browser_auth_refresh import BrowserRefreshSettings, refresh_extra_auth_from_browser
+from autodatareport.atomic_io import atomic_write_text
 from autodatareport.gui_runtime import GuiEvent, parse_event_line
+from autodatareport.models import PublishResolution
+from autodatareport.gui_task_controller import GuiTaskController
 from autodatareport.process_runner import TaskProcessRunner
 from fenxi_auth_from_har import refresh_fenxi_auth_from_hars
 from pc_auth_from_har import refresh_pc_auth_from_hars
 from readiness import ReadinessState, classify_failure, validate_configuration
+from publish_state import PublishStateStore
 
 
 PROGRESS_RE = re.compile(r"\[PROGRESS\]\s*(\d{1,3})\|(.+)")
@@ -35,7 +39,7 @@ FEISHU_PC_URL_RE = re.compile(r"Feishu PC doc published:\s*(https?://\S+)")
 
 class ReportLauncherApp:
     LAUNCHD_LABEL = "com.starfish.autodatareport.daily"
-    APP_VERSION = "1.4"
+    APP_VERSION = "1.5"
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -56,11 +60,12 @@ class ReportLauncherApp:
         self.playwright_recover_script = self.bundle_root / "auth_recovery_playwright.py"
         self.python_bin = self._resolve_python_bin()
 
-        self.process: Optional[subprocess.Popen[str]] = None
         self.process_runner = TaskProcessRunner()
+        self.task_controller = GuiTaskController(self.process_runner)
         self.worker_thread: Optional[threading.Thread] = None
         self.aux_running = False
         self.queue: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.date_mode = tk.StringVar(value="yesterday")
         self.date_value = tk.StringVar(value=(date.today() - timedelta(days=1)).isoformat())
@@ -78,6 +83,8 @@ class ReportLauncherApp:
         self.feishu_url_main = tk.StringVar(value="")
         self.feishu_url_pc = tk.StringVar(value="")
         self.log_history: list[str] = []
+        self.last_failure_kind = ""
+        self.last_failure_source = ""
         self.details_visible = False
         self.has_auto_retried = False
         self.has_870_cookie_retried = False
@@ -683,6 +690,8 @@ class ReportLauncherApp:
         if not from_auto_retry:
             self.has_auto_retried = False
         self.log_history = []
+        self.last_failure_kind = ""
+        self.last_failure_source = ""
         run_date = self.date_value.get().strip()
         if not from_auto_retry:
             self.has_870_cookie_retried = False
@@ -712,44 +721,44 @@ class ReportLauncherApp:
         self.btn_start.configure(state=tk.DISABLED)
         self.btn_stop.configure(state=tk.NORMAL)
 
-        def _worker() -> None:
-            try:
-                self.process = self.process_runner.open(cmd, cwd=self.project_root, env=env)
+        def handle_line(task_id: int, line: str) -> None:
+            event = parse_event_line(line)
+            if event is not None:
+                self.queue.put(("task_event", (task_id, event)))
+                return
+            self.queue.put(("task_line", (task_id, line)))
+            progress_match = PROGRESS_RE.search(line)
+            if progress_match:
+                self.queue.put(("task_progress", (task_id, int(progress_match.group(1)), progress_match.group(2).strip())))
 
-                def handle_line(line: str) -> None:
-                    event = parse_event_line(line)
-                    if event is not None:
-                        self.queue.put(("event", event))
-                        return
-                    self.queue.put(("line", line))
-                    progress_match = PROGRESS_RE.search(line)
-                    if progress_match:
-                        pct = int(progress_match.group(1))
-                        msg = progress_match.group(2).strip()
-                        self.queue.put(("progress", pct))
-                        self.queue.put(("status", msg))
-                    pc_url_match = FEISHU_PC_URL_RE.search(line)
-                    if pc_url_match:
-                        self.queue.put(("feishu_pc", pc_url_match.group(1).strip()))
-                    else:
-                        main_url_match = FEISHU_MAIN_URL_RE.search(line)
-                        if main_url_match:
-                            self.queue.put(("feishu_main", main_url_match.group(1).strip()))
-
-                rc = self.process_runner.stream(self.process, handle_line)
-                self.queue.put(("done", rc))
-            except Exception as exc:  # noqa: BLE001
-                self.queue.put(("line", f"[GUI ERROR] {exc}"))
-                self.queue.put(("done", 1))
-
-        self.worker_thread = threading.Thread(target=_worker, daemon=True)
-        self.worker_thread.start()
+        try:
+            self.task_controller.start(
+                cmd,
+                cwd=self.project_root,
+                env=env,
+                kind="report",
+                label="日报任务",
+                on_line=handle_line,
+                on_done=lambda task_id, rc: self.queue.put(("done", (task_id, rc))),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"[GUI ERROR] {exc}")
+            self.btn_start.configure(state=tk.NORMAL)
+            self.btn_stop.configure(state=tk.DISABLED)
+            self._set_visual_state("error")
+            messagebox.showerror("启动失败", str(exc))
 
     def stop_run(self) -> None:
-        if self.process is None:
+        active = self.task_controller.active
+        if active is None:
+            return
+        if active.publishing and not messagebox.askyesno(
+            "发送阶段仍在进行",
+            "停止后可能需要确认飞书或企微是否已经发送。仍要停止吗？",
+        ):
             return
         try:
-            self.process_runner.terminate(self.process)
+            self.task_controller.stop()
         except Exception:  # noqa: BLE001
             pass
         self.status_text.set("已请求停止")
@@ -762,7 +771,36 @@ class ReportLauncherApp:
             except queue.Empty:
                 break
 
-            if kind == "line":
+            if kind == "task_line":
+                task_id, text = value  # type: ignore[misc]
+                if not self.task_controller.is_current(int(task_id)):
+                    continue
+                self._append_log(str(text))
+            elif kind == "task_event":
+                task_id, event = value  # type: ignore[misc]
+                if not self.task_controller.is_current(int(task_id)) or not isinstance(event, GuiEvent):
+                    continue
+                self.task_controller.set_stage(int(task_id), event.stage)
+                if event.kind == "run_finished" and event.failure_kind:
+                    self.last_failure_kind = event.failure_kind
+                    self.last_failure_source = event.failure_source
+                self._append_log("[EVENT] " + event.log_line())
+                if event.progress is not None:
+                    self._set_progress(event.progress, event.message or None)
+                elif event.message and event.kind in {"stage_started", "artifact", "publish_finished"}:
+                    self.status_text.set(event.message)
+                if event.url and event.target == "pc":
+                    self.feishu_url_pc.set(event.url)
+                    self._set_feishu_menu_state()
+                elif event.url and event.target == "main":
+                    self.feishu_url_main.set(event.url)
+                    self._set_feishu_menu_state()
+            elif kind == "task_progress":
+                task_id, pct, message = value  # type: ignore[misc]
+                if not self.task_controller.is_current(int(task_id)):
+                    continue
+                self._set_progress(int(pct), str(message))
+            elif kind == "line":
                 text = str(value)
                 self._append_log(text)
                 pc_url_match = FEISHU_PC_URL_RE.search(text)
@@ -800,8 +838,10 @@ class ReportLauncherApp:
                 self.feishu_url_pc.set(str(value))
                 self._set_feishu_menu_state()
             elif kind == "done":
-                rc = int(value)
-                self.process = None
+                task_id, rc = value  # type: ignore[misc]
+                if not self.task_controller.finish(int(task_id)):
+                    continue
+                rc = int(rc)
                 self.btn_start.configure(state=tk.NORMAL)
                 self.btn_stop.configure(state=tk.DISABLED)
                 if rc == 0:
@@ -818,6 +858,8 @@ class ReportLauncherApp:
                         self.result_text.set("任务完成：日报文件已生成，可在输出文件夹中查看。")
                     self._append_log("[GUI] 任务完成")
                 else:
+                    if self._handle_uncertain_publish():
+                        continue
                     if (not self.has_870_cookie_retried) and self._looks_like_870_cookie_failure():
                         if self.prompt_870_cookie_repair(retry_after_save=True):
                             continue
@@ -841,8 +883,14 @@ class ReportLauncherApp:
                     self._append_log(f"[GUI] 任务失败，退出码={rc}")
                     messagebox.showerror("任务未完成", "详细日志已经展开。请按最后一条提示处理后重试。")
             elif kind == "aux_done":
-                rc, label = value  # type: ignore[misc]
+                if isinstance(value, tuple) and len(value) == 3:
+                    task_id, rc, label = value
+                    if not self.task_controller.finish(int(task_id)):
+                        continue
+                else:
+                    rc, label = value  # type: ignore[misc]
                 self.aux_running = False
+                self.btn_stop.configure(state=tk.DISABLED)
                 if int(rc) == 0:
                     self._append_log(f"[GUI] {label}完成")
                     if label == "首次设置":
@@ -853,8 +901,11 @@ class ReportLauncherApp:
                     messagebox.showerror("失败", f"{label}失败，请查看日志。")
                 self._refresh_schedule_status()
             elif kind == "recover_done":
-                ok, reason = value  # type: ignore[misc]
+                task_id, ok, reason = value  # type: ignore[misc]
+                if not self.task_controller.finish(int(task_id)):
+                    continue
                 self.aux_running = False
+                self.btn_stop.configure(state=tk.DISABLED)
                 if ok:
                     self._append_log("[GUI] 自动登录修复完成，开始重试任务")
                     self.status_text.set("自动修复成功，任务重试中")
@@ -871,7 +922,7 @@ class ReportLauncherApp:
         self.root.after(120, self._drain_queue)
 
     def _is_busy(self) -> bool:
-        return self.process is not None or self.aux_running
+        return self.task_controller.busy or self.aux_running
 
     def _run_aux_command(self, label: str, cmd: list[str]) -> None:
         if self._is_busy():
@@ -884,29 +935,21 @@ class ReportLauncherApp:
         self._append_log(f"[GUI] {label}")
         self._append_log("执行命令: " + " ".join(cmd))
 
-        def _worker() -> None:
-            rc = 1
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    cwd=str(self.project_root),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    env=env,
-                )
-                assert proc.stdout is not None
-                for raw_line in proc.stdout:
-                    line = raw_line.rstrip("\n")
-                    self.queue.put(("line", line))
-                rc = proc.wait()
-            except Exception as exc:  # noqa: BLE001
-                self.queue.put(("line", f"[GUI ERROR] {exc}"))
-                rc = 1
-            self.queue.put(("aux_done", (rc, label)))
-
-        threading.Thread(target=_worker, daemon=True).start()
+        try:
+            self.task_controller.start(
+                cmd,
+                cwd=self.project_root,
+                env=env,
+                kind="aux",
+                label=label,
+                on_line=lambda task_id, line: self.queue.put(("task_line", (task_id, line))),
+                on_done=lambda task_id, rc: self.queue.put(("aux_done", (task_id, rc, label))),
+            )
+            self.btn_stop.configure(state=tk.NORMAL)
+        except Exception as exc:  # noqa: BLE001
+            self.aux_running = False
+            self._append_log(f"[GUI ERROR] {exc}")
+            messagebox.showerror("启动失败", str(exc))
 
     def _run_aux_callable(self, label: str, worker_fn) -> None:
         if self.aux_running:
@@ -933,7 +976,7 @@ class ReportLauncherApp:
         if self.aux_running:
             messagebox.showinfo("提示", "当前有辅助任务在执行，请稍后再试。")
             return False
-        if self.process is None:
+        if not self.task_controller.busy:
             return True
         should_stop = messagebox.askyesno(
             "当前任务仍在执行",
@@ -941,19 +984,15 @@ class ReportLauncherApp:
         )
         if not should_stop:
             return False
-        proc = self.process
         self._append_log(f"[GUI] 为执行“{label}”，先停止当前任务")
         try:
-            self.process_runner.terminate(proc)
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=2)
+            self.task_controller.stop()
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("停止失败", f"无法停止当前任务：{exc}")
             return False
-        self.process = None
+        active = self.task_controller.active
+        if active is not None:
+            self.task_controller.finish(active.task_id)
         self.btn_start.configure(state=tk.NORMAL)
         self.btn_stop.configure(state=tk.DISABLED)
         self.status_text.set("主流程已停止，可更新登录态")
@@ -967,11 +1006,59 @@ class ReportLauncherApp:
             return haystack.rsplit(marker, 1)[-1]
         return haystack
 
+    def _handle_uncertain_publish(self) -> bool:
+        legacy_match = "发送结果待确认" in self._recent_failure_text() or "已阻止自动重发" in self._recent_failure_text()
+        if self.last_failure_kind != "publish_uncertain" and not legacy_match:
+            return False
+        try:
+            report_date = date.fromisoformat(self.date_value.get().strip())
+            store = PublishStateStore(self.project_root / "output", report_date)
+            entries = store.uncertain_entries()
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"[GUI] 无法读取待确认发布状态: {exc}")
+            return False
+        if not entries:
+            return False
+        urls = [str(entry.result.get("url") or "").strip() for entry in entries]
+        urls = [url for url in urls if url]
+        if urls:
+            self.feishu_url_main.set(urls[0])
+            self._set_feishu_menu_state()
+        targets = "、".join(entry.target for entry in entries)
+        choice = messagebox.askyesnocancel(
+            "发送结果待确认",
+            f"以下目标可能已经发送：{targets}\n\n"
+            "请先到飞书或企微检查。\n"
+            "选择“是”：已经看到，标记为完成。\n"
+            "选择“否”：确认没有发送，立即重试。\n"
+            "选择“取消”：暂不处理，并继续阻止自动重发。",
+        )
+        if choice is True:
+            for entry in entries:
+                store.resolve_uncertain(entry.target, PublishResolution.COMPLETED)
+            self.status_text.set("待确认发送已标记完成")
+            self._set_visual_state("success")
+            self._append_log("[GUI] 用户确认远端已发送，状态已标记完成")
+        elif choice is False:
+            for entry in entries:
+                store.resolve_uncertain(entry.target, PublishResolution.RETRY)
+            self._append_log("[GUI] 用户确认远端未发送，开始重试")
+            self.start_run(from_auto_retry=True)
+        else:
+            self.status_text.set("发送结果待确认")
+            self._set_visual_state("error")
+            self._toggle_logs(force=True)
+        return True
+
     def _looks_like_870_cookie_failure(self) -> bool:
+        if self.last_failure_kind == "login_required" and self.last_failure_source == "870":
+            return True
         haystack = self._recent_failure_text()
         return classify_failure(haystack) == ReadinessState.LOGIN_REQUIRED
 
     def _looks_like_auth_failure(self) -> bool:
+        if self.last_failure_kind == "login_required":
+            return True
         haystack = self._recent_failure_text()
         lowered = haystack.lower()
         non_repairable_870_markers = [
@@ -1031,9 +1118,7 @@ class ReportLauncherApp:
             raise ValueError("config.yaml 结构异常，未写入 PHPSESSID。")
 
         shutil.copy2(self.config_path, backup_path)
-        temp_path = self.config_path.with_name(f".{self.config_path.name}.tmp-{os.getpid()}")
-        temp_path.write_text(updated, encoding="utf-8")
-        os.replace(temp_path, self.config_path)
+        atomic_write_text(self.config_path, updated)
         backups = sorted(
             self.config_path.parent.glob(f"{self.config_path.name}.bak-*"),
             key=lambda path: path.stat().st_mtime,
@@ -1167,30 +1252,26 @@ class ReportLauncherApp:
             "both",
         )
 
-        def _worker() -> None:
-            try:
-                self.queue.put(("line", "=" * 84))
-                self.queue.put(("line", "[GUI] Running thin auth repair"))
-                self.queue.put(("line", "执行命令: " + " ".join(cmd)))
-                proc = subprocess.Popen(
-                    cmd,
-                    cwd=str(self.project_root),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    env={**os.environ.copy(), **self._load_scheduler_env()},
-                )
-                assert proc.stdout is not None
-                for raw_line in proc.stdout:
-                    self.queue.put(("line", raw_line.rstrip("\n")))
-                rc = proc.wait()
-                self.queue.put(("recover_done", (rc == 0, "" if rc == 0 else f"退出码={rc}")))
-            except Exception as exc:  # noqa: BLE001
-                self.queue.put(("line", f"[GUI ERROR] {exc}"))
-                self.queue.put(("recover_done", (False, str(exc))))
-
-        threading.Thread(target=_worker, daemon=True).start()
+        self._append_log("=" * 84)
+        self._append_log("[GUI] Running thin auth repair")
+        self._append_log("执行命令: " + " ".join(cmd))
+        try:
+            self.task_controller.start(
+                cmd,
+                cwd=self.project_root,
+                env={**os.environ.copy(), **self._load_scheduler_env()},
+                kind="auth_repair",
+                label="自动登录修复",
+                on_line=lambda task_id, line: self.queue.put(("task_line", (task_id, line))),
+                on_done=lambda task_id, rc: self.queue.put(
+                    ("recover_done", (task_id, rc == 0, "" if rc == 0 else f"退出码={rc}"))
+                ),
+            )
+            self.btn_stop.configure(state=tk.NORMAL)
+        except Exception as exc:  # noqa: BLE001
+            self.aux_running = False
+            self._append_log(f"[GUI ERROR] {exc}")
+            messagebox.showerror("自动修复启动失败", str(exc))
 
     def _load_config(self) -> Dict[str, object]:
         if not self.config_path.exists():
@@ -1551,6 +1632,22 @@ class ReportLauncherApp:
             self._append_log(result.stdout.strip())
         self._refresh_schedule_status()
         messagebox.showinfo("成功", "定时任务已取消。")
+
+    def _on_close(self) -> None:
+        active = self.task_controller.active
+        if active is not None:
+            detail = "当前正在发送，关闭后下次运行可能要求确认是否已发送。" if active.publishing else "当前任务仍在运行。"
+            if not messagebox.askyesno("关闭一键工作台", f"{detail}\n是否停止任务并关闭？"):
+                return
+            try:
+                self.task_controller.stop()
+            except Exception as exc:  # noqa: BLE001
+                if not messagebox.askyesno("停止失败", f"无法完整停止任务：{exc}\n仍要关闭吗？"):
+                    return
+        elif self.aux_running:
+            if not messagebox.askyesno("关闭一键工作台", "辅助任务仍在运行，关闭后任务会中断。仍要关闭吗？"):
+                return
+        self.root.destroy()
 
 
 def main() -> None:

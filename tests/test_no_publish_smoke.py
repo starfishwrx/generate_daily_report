@@ -44,10 +44,13 @@ class NoPublishSmokeTests(unittest.TestCase):
                 concurrency=MetricSummary(formatted_peak_value="1", peak_time_label="10点"),
                 queue=MetricSummary(formatted_peak_value="0", peak_time_label="无"),
             )
-            with mock.patch("generate_daily_report.run_full_auth_preflight_with_repair"):
-                with mock.patch("generate_daily_report.build_target_result", return_value=target):
-                    with mock.patch("generate_daily_report.publish_report_to_feishu_doc") as feishu_publish:
-                        with mock.patch("generate_daily_report.push_reports_to_wecom_target") as wecom_publish:
+            with mock.patch(
+                "autodatareport.application.run_full_auth_preflight_async",
+                new=mock.AsyncMock(return_value=({}, None, None)),
+            ):
+                with mock.patch("autodatareport.application.build_target_result", return_value=target):
+                    with mock.patch("autodatareport.application.publish_report_to_feishu_doc") as feishu_publish:
+                        with mock.patch("autodatareport.application.push_reports_to_wecom_target") as wecom_publish:
                             main(
                                 [
                                     "--data-dir",

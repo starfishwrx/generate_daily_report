@@ -1,4 +1,4 @@
-# 云游戏日报自动化工具（V1.3）
+# 云游戏日报自动化工具（V1.5）
 
 自动抓取多个后台数据统计，并制作可视化表格，渲染合并成一整份完整的数据日报
 
@@ -212,15 +212,17 @@ chmod +x scripts/build_release_macos.sh
 - 打包时只包含 `config.example.yaml`，不会打包本地 `config.yaml`、`extra_auth.json` 等敏感文件。
 - Windows `.exe` 需在 Windows 环境打包（保留 `build_exe.bat` 流程）。
 
-### Windows V1.3 一键工作台与运行数据
+### Windows V1.5 一键工作台与运行数据
 
-执行 `build_exe.bat` 会按 `uv.lock` 构建 `dist/windows-release-v1.3.0/`，并生成包含版本、文件大小和 SHA-256 的 `release-manifest.json`。V1.2 发布目录会完整保留，发布目录不会复制本机的 `config.yaml`、`.env.scheduler`、`extra_auth.json`、hosts 文件或历史输出。
+执行 `build_exe.bat` 会按 `uv.lock` 构建 `dist/windows-release-v1.5.0/`，并生成版本、完整文件清单、文件大小、SHA-256 和敏感文件扫描结果。V1.4 发布目录会完整保留，发布目录不会复制本机的 `config.yaml`、`.env.scheduler`、`extra_auth.json` 或历史输出。
 
 打包版把可变数据放在 `%LOCALAPPDATA%\AutoDataReport\`。首次启动会从旧 `windows-release` 复制已有配置（保留原文件），没有旧配置时则从示例创建。自动任务仍默认推送；本地验证可加 `--no-publish`，手工明确重推可加 `--force-publish`。相同日期、相同内容的成功发布会记录在 `output/publish_state/` 并在重试时跳过。
 
-V1.3 GUI 默认选择昨天、完整数据、自动发送和登录失效自动修复，正常使用只需点击一次“生成并发送昨天日报”。GUI 优先读取结构化事件，技术日志默认折叠；完成后可直接打开主日报、PC 日报或输出文件夹，高级运行选项和登录修复统一放在右上角。
+V1.5 GUI 默认选择昨天、完整数据、自动发送和登录失效自动修复，正常使用只需点击一次“生成并发送昨天日报”。正式日报、首次设置和自动修复统一受停止按钮与窗口关闭逻辑管理。若发送中断且无法确认远端结果，程序会阻止自动重发，并让用户检查后选择“标记完成”或“确认未发送后重试”。
 
 每次执行会在 `output/run_metrics/` 写入阶段耗时、请求数、重试数和图表缓存命中数据。870、扩展指标和 PC 数据会在登录预检后并行采集；主日报与 PC 日报共享一次飞书 tenant token 并行创建，单文档图片上传并发上限为 3。
+
+发布状态继续使用 `output/publish_state/YYYYMMDD.json`，V1.5 schema 支持 `pending`、`publishing`、`failed`、`uncertain` 和 `completed`，无需安装数据库。旧版 completed 状态会自动兼容。
 
 仅跑 870 主报告：
 

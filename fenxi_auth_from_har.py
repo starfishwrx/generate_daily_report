@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Sequence
 
 from extra_auth import _collect_auth_data, inspect_fenxi_token
+from autodatareport.atomic_io import atomic_write_json
 
 
 class FenxiAuthRefreshError(RuntimeError):
@@ -61,7 +62,7 @@ def refresh_fenxi_auth_from_hars(
     payload["meta"] = updated_meta
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(output, payload)
     return {
         "output_path": str(output),
         "fenxi_present": bool(diag.get("present")),

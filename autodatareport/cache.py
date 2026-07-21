@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import threading
 from pathlib import Path
 from typing import Any, Iterable
+
+from autodatareport.atomic_io import atomic_write_json
 
 
 def hash_payload(parts: Iterable[Any]) -> str:
@@ -51,7 +52,4 @@ class ArtifactCache:
 
     def save(self) -> None:
         with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = self.path.with_suffix(f".tmp-{os.getpid()}-{threading.get_ident()}")
-            temp_path.write_text(json.dumps(self.entries, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            os.replace(temp_path, self.path)
+            atomic_write_json(self.path, self.entries)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 import threading
 import time
@@ -11,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator, TextIO
 
 from .models import StageEvent
+from .atomic_io import atomic_write_json
 
 
 class JsonlEventSink:
@@ -91,10 +91,7 @@ class RunMetricsRecorder:
             "stages": self.stages,
             "counters": self.counters,
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = self.path.with_suffix(f".tmp-{os.getpid()}")
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(temp_path, self.path)
+        atomic_write_json(self.path, payload)
         return self.path
 
 

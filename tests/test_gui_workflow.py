@@ -56,7 +56,7 @@ class GuiWorkflowTests(unittest.TestCase):
 
     def test_gui_enables_v14_event_stream_and_global_limit(self) -> None:
         command = self.make_app()._build_command()
-        self.assertEqual(ReportLauncherApp.APP_VERSION, "1.4")
+        self.assertEqual(ReportLauncherApp.APP_VERSION, "1.5")
         self.assertIn("--event-stream", command)
         self.assertIn("jsonl", command)
         self.assertIn("--max-total-concurrency", command)

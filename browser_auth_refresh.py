@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from extra_auth import inspect_fenxi_token
 from pc_web_metrics_service import PCWebMetricsService, PCWebSettings
+from autodatareport.atomic_io import atomic_write_json
 
 CHAIN_RE = re.compile(r"(?:^|[&?])chain=(\d+)(?:$|[&])")
 
@@ -439,7 +440,7 @@ def refresh_extra_auth_from_browser(settings: BrowserRefreshSettings) -> Dict[st
     }
 
     settings.output_path.parent.mkdir(parents=True, exist_ok=True)
-    settings.output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(settings.output_path, payload)
 
     fenxi_diag = inspect_fenxi_token(fenxi_block, warn_threshold_hours=settings.fenxi_warn_threshold_hours)
     return {

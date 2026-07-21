@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config_migration import contains_placeholder, normalize_company_endpoints  # noqa: E402
+from autodatareport.atomic_io import atomic_write_yaml  # noqa: E402
 
 
 REQUIRED_PATHS = (
@@ -37,7 +38,7 @@ def sanitize_config(config: Mapping[str, Any]) -> dict[str, Any]:
         base = str(payload.get("base_url") or "").strip()
         parsed = urllib.parse.urlsplit(base)
         if parsed.scheme and parsed.netloc:
-            payload["login_url_870"] = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "m=user&ac=login", ""))
+            payload["login_url_870"] = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
     for path in REQUIRED_PATHS:
         value = _get(payload, path)
         if not str(value or "").strip() or contains_placeholder(value):
@@ -79,7 +80,7 @@ def prepare(source: Path, output_dir: Path) -> Path:
     sanitized = sanitize_config(raw)
     output_dir.mkdir(parents=True, exist_ok=True)
     target = output_dir / "company-defaults.yaml"
-    target.write_text(yaml.safe_dump(sanitized, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    atomic_write_yaml(target, sanitized)
     source_dir = source.parent
     network = raw.get("network") if isinstance(raw.get("network"), Mapping) else {}
     extra = raw.get("extra_metrics") if isinstance(raw.get("extra_metrics"), Mapping) else {}

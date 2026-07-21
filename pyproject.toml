@@ -1,6 +1,6 @@
 [project]
 name = "report-automation"
-version = "1.4.0"
+version = "1.5.0"
 description = "Daily cloud gaming report generator"
 requires-python = ">=3.10"
 dependencies = [
@@ -22,3 +22,20 @@ dependencies = [
 [dependency-groups]
 build = ["pyinstaller==6.20.0", "setuptools>=83.0.0"]
 dev = ["pip-audit>=2.9.0", "pytest>=8.0.0", "ruff>=0.11.0", "setuptools>=83.0.0"]
+
+[tool.ruff.lint]
+extend-select = ["C90"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
+[tool.ruff.lint.per-file-ignores]
+"report_launcher_gui.py" = ["C901"]
+"auth_repair.py" = ["C901"]
+"auth_recovery_playwright.py" = ["C901"]
+"browser_auth_refresh.py" = ["C901"]
+"extra_auth.py" = ["C901"]
+"extra_metrics_service.py" = ["C901"]
+"extra_metrics_render.py" = ["C901"]
+"pc_web_metrics_service.py" = ["C901"]
+"feishu_doc.py" = ["C901"]

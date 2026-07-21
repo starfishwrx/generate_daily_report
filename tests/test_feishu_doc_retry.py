@@ -20,6 +20,7 @@ class FeishuDocRetryTests(unittest.TestCase):
                     timeout=60,
                     request_retries=3,
                     retry_backoff_seconds=0.1,
+                    safe_to_retry=True,
                     headers={"Authorization": "Bearer t"},
                 )
         self.assertIs(result, response)
@@ -50,6 +51,7 @@ class FeishuDocRetryTests(unittest.TestCase):
                     timeout=60,
                     request_retries=2,
                     retry_backoff_seconds=0.1,
+                    safe_to_retry=True,
                 )
         self.assertIs(result, success)
         self.assertEqual(mocked_request.call_count, 2)

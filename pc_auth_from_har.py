@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Sequence
 
 from extra_auth import _collect_auth_data
+from autodatareport.atomic_io import atomic_write_json
 
 
 class PCAuthRefreshError(RuntimeError):
@@ -67,7 +68,7 @@ def refresh_pc_auth_from_hars(
     payload["meta"] = updated_meta
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(output, payload)
     reason = "pc_web 鉴权已更新"
     if not (has_bearer or has_authorization):
         reason = "仅提取到 Admin-Token（建议补抓包含 Bearer 的 HAR）"

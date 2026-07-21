@@ -1,20 +1,23 @@
 from __future__ import annotations
 
-from datetime import date
-from typing import Any, Mapping, Protocol
+from typing import Any, Protocol
 
-from .models import PublishResult, ReportArtifact
-
-
-class DataSource(Protocol):
-    async def preflight(self, query_date: date, auth: Mapping[str, Any] | None) -> Mapping[str, Any]: ...
-
-    async def fetch(self, query_date: date, auth: Mapping[str, Any] | None) -> Mapping[str, Any]: ...
+from autodatareport.models import PreflightSnapshot, ReportArtifact, RunContext
 
 
-class Publisher(Protocol):
-    def publish(self, artifact: ReportArtifact) -> PublishResult: ...
+class SourceAdapter(Protocol):
+    async def preflight(self, context: RunContext) -> PreflightSnapshot: ...
+
+    async def fetch(self, context: RunContext, snapshot: PreflightSnapshot | None = None) -> Any: ...
 
 
-class EventSink(Protocol):
-    def emit(self, event: Any) -> None: ...
+class MetricsCalculator(Protocol):
+    def calculate(self, context: RunContext, source_data: dict[str, Any]) -> dict[str, Any]: ...
+
+
+class ReportRenderer(Protocol):
+    def render(self, context: RunContext, metrics: dict[str, Any]) -> dict[str, ReportArtifact]: ...
+
+
+class ArtifactPublisher(Protocol):
+    def publish(self, context: RunContext, artifacts: dict[str, ReportArtifact]) -> dict[str, Any]: ...

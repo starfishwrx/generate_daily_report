@@ -208,8 +208,8 @@ class PublishConcurrencyTests(unittest.TestCase):
             barrier.wait(timeout=2)
             return {"url": f"https://example.test/{kwargs['report_text']}"}
 
-        with mock.patch("generate_daily_report.fetch_tenant_access_token", return_value="shared") as token_mock:
-            with mock.patch("generate_daily_report.publish_report_to_feishu_doc", side_effect=fake_publish) as publish_mock:
+        with mock.patch("autodatareport.application.fetch_tenant_access_token", return_value="shared") as token_mock:
+            with mock.patch("autodatareport.application.publish_report_to_feishu_doc", side_effect=fake_publish) as publish_mock:
                 batch = publish_feishu_jobs(settings, [job("main"), job("pc")])
         token_mock.assert_called_once_with(settings)
         self.assertEqual(publish_mock.call_count, 2)
@@ -236,8 +236,8 @@ class PublishConcurrencyTests(unittest.TestCase):
                 raise FeishuDocError("pc failed")
             return {"url": "https://example.test/main"}
 
-        with mock.patch("generate_daily_report.fetch_tenant_access_token", return_value="shared"):
-            with mock.patch("generate_daily_report.publish_report_to_feishu_doc", side_effect=fake_publish):
+        with mock.patch("autodatareport.application.fetch_tenant_access_token", return_value="shared"):
+            with mock.patch("autodatareport.application.publish_report_to_feishu_doc", side_effect=fake_publish):
                 batch = publish_feishu_jobs(settings, [job("main"), job("pc")])
         self.assertEqual(batch.results["main"][0]["url"], "https://example.test/main")
         self.assertIsInstance(batch.errors["pc"], FeishuDocError)

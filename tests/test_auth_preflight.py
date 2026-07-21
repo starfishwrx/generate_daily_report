@@ -44,7 +44,7 @@ class AuthPreflightTests(unittest.TestCase):
             "network": {"proxy_mode": "direct"},
             "targets": {"total": {"label": "总", "queries": [{"params": {"game_type": 0}}]}},
         }
-        with mock.patch("generate_daily_report.fetch_json", return_value={"ok": True}) as mocked_fetch:
+        with mock.patch("autodatareport.application.fetch_json", return_value={"ok": True}) as mocked_fetch:
             result = preflight_870_auth(config, args, date(2026, 3, 7))
         self.assertTrue(result["ok"])
         self.assertEqual(result["message"], "870登录态可用: 总")

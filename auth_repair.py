@@ -18,6 +18,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from browser_auth_refresh import build_pc_bearer, parse_chain_from_bearer
 from extra_auth import inspect_fenxi_token
 from pc_web_metrics_service import PCWebMetricsService, PCWebSettings
+from autodatareport.atomic_io import atomic_write_json
+from autodatareport.redaction import redact_sensitive_text
 
 
 DEFAULT_CHROME_EXE = Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe")
@@ -373,7 +375,7 @@ def recover_auth_with_chrome_profile(settings: AuthRepairSettings) -> Dict[str, 
                         browser=settings.browser,
                         pc_chain=selected_chain,
                     )
-                    settings.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                    atomic_write_json(settings.output, payload)
                     return {
                         "ok": True,
                         "output_path": str(settings.output),
@@ -439,11 +441,7 @@ def _append_log(path: Optional[Path], message: str) -> None:
 
 
 def _redact(text: str) -> str:
-    out = str(text or "")
-    out = re.sub(r"(e_token=)[^;\s&]+", r"\1<redacted>", out, flags=re.IGNORECASE)
-    out = re.sub(r"(Admin-Token[:=]\s*)[^;\s&]+", r"\1<redacted>", out, flags=re.IGNORECASE)
-    out = re.sub(r"(token=)[^;\s&]+", r"\1<redacted>", out, flags=re.IGNORECASE)
-    return out
+    return redact_sensitive_text(text)
 
 
 def _find_free_port() -> int:

@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import unquote, urlsplit
 
+from autodatareport.atomic_io import atomic_write_json
+
 TOKEN_RE = re.compile(r"access_token=([^&\"'\s<>]+)")
 
 
@@ -285,7 +287,7 @@ def build_extra_auth_file(
         },
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(output_path, payload)
     return output_path
 
 

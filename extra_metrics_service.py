@@ -4,6 +4,7 @@ import json
 import random
 import re
 import time
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -308,13 +309,20 @@ class ExtraMetricsService:
         if not self.manage_base:
             self.manage_base = "http://<MANAGE_HOST>"
         self.debug_log = DebugLogStore(settings.query_debug_log_path)
+        self._shared_clients: dict[str, httpx.AsyncClient] = {}
+        self._reuse_clients = False
 
-    async def _record_request(self, _request: httpx.Request) -> None:
+    async def _record_request(self, request: httpx.Request) -> None:
         metrics = current_metrics()
         if metrics is not None:
             metrics.increment("requests")
+            source = "fenxi" if request.url.host == urlsplit(self.fenxi_base).hostname else "505"
+            metrics.increment(f"requests_{source}")
 
     def _client(self) -> httpx.AsyncClient:
+        metrics = current_metrics()
+        if metrics is not None:
+            metrics.increment("http_clients_created")
         return RetryingAsyncClient(
             timeout=self.settings.request_timeout,
             follow_redirects=True,
@@ -322,6 +330,27 @@ class ExtraMetricsService:
             trust_env=False,
             event_hooks={"request": [self._record_request]},
         )
+
+    def enable_client_reuse(self) -> None:
+        self._reuse_clients = True
+
+    async def aclose(self) -> None:
+        clients = list(self._shared_clients.values())
+        self._shared_clients.clear()
+        for client in clients:
+            await client.aclose()
+
+    @asynccontextmanager
+    async def _client_scope(self, key: str):
+        if self._reuse_clients:
+            client = self._shared_clients.get(key)
+            if client is None:
+                client = self._client()
+                self._shared_clients[key] = client
+            yield client
+            return
+        async with self._client() as client:
+            yield client
 
     async def fetch(
         self,
@@ -378,7 +407,7 @@ class ExtraMetricsService:
                 return {"ok": False, "message": "fenxi认证信息缺失"}
             try:
                 auth_headers = self._auth_headers(fenxi_auth)
-                async with self._client() as client:
+                async with self._client_scope("fenxi") as client:
                     self._apply_auth(client, fenxi_auth)
                     await self._fenxi_module_switch(client, auth_headers)
                 return {"ok": True, "message": "fenxi登录态可用"}
@@ -391,7 +420,7 @@ class ExtraMetricsService:
             try:
                 auth_headers = self._auth_headers(manage_auth)
                 hosts_map = load_hosts_map(self.settings.hosts_yaml_path)
-                async with self._client() as client:
+                async with self._client_scope("manage") as client:
                     self._apply_auth(client, manage_auth)
                     await self._bootstrap_callback(client, manage_auth, hosts_map)
                     await self._manage_recharge_detail(client, hosts_map, "gz_web", query_date, auth_headers)
@@ -413,7 +442,7 @@ class ExtraMetricsService:
         top_games: list[dict[str, Any]] = []
         auth_headers = self._auth_headers(auth)
 
-        async with self._client() as client:
+        async with self._client_scope("fenxi") as client:
             self._apply_auth(client, auth)
             await self._fenxi_module_switch(client, auth_headers)
 
@@ -479,7 +508,7 @@ class ExtraMetricsService:
         hosts_map = load_hosts_map(self.settings.hosts_yaml_path)
         auth_headers = self._auth_headers(auth)
 
-        async with self._client() as client:
+        async with self._client_scope("manage") as client:
             self._apply_auth(client, auth)
             await self._bootstrap_callback(client, auth, hosts_map)
 

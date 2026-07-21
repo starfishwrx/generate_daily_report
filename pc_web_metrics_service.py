@@ -5,6 +5,7 @@ import json
 import random
 import re
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -321,13 +322,20 @@ class PCWebMetricsService:
         self.fenxi_base = str(settings.fenxi_base or "").rstrip("/")
         if not self.fenxi_base:
             self.fenxi_base = "https://fenxi.4399dev.com"
+        self._shared_clients: dict[str, httpx.AsyncClient] = {}
+        self._reuse_clients = False
 
-    async def _record_request(self, _request: httpx.Request) -> None:
+    async def _record_request(self, request: httpx.Request) -> None:
         metrics = current_metrics()
         if metrics is not None:
             metrics.increment("requests")
+            source = "pc_member" if request.url.host == urlsplit(self.fenxi_base).hostname else "pc_web"
+            metrics.increment(f"requests_{source}")
 
     def _client(self) -> httpx.AsyncClient:
+        metrics = current_metrics()
+        if metrics is not None:
+            metrics.increment("http_clients_created")
         return RetryingAsyncClient(
             timeout=self.settings.request_timeout,
             follow_redirects=True,
@@ -335,6 +343,27 @@ class PCWebMetricsService:
             trust_env=False,
             event_hooks={"request": [self._record_request]},
         )
+
+    def enable_client_reuse(self) -> None:
+        self._reuse_clients = True
+
+    async def aclose(self) -> None:
+        clients = list(self._shared_clients.values())
+        self._shared_clients.clear()
+        for client in clients:
+            await client.aclose()
+
+    @asynccontextmanager
+    async def _client_scope(self, key: str):
+        if self._reuse_clients:
+            client = self._shared_clients.get(key)
+            if client is None:
+                client = self._client()
+                self._shared_clients[key] = client
+            yield client
+            return
+        async with self._client() as client:
+            yield client
 
     async def preflight(self, query_date: date, auth: dict[str, Any] | None) -> dict[str, Any]:
         if not auth:
@@ -364,7 +393,7 @@ class PCWebMetricsService:
             offset = self._date_offset(query_date)
             payload_probe = self._payload_pc_member_total_single(offset)
             auth_headers = self._auth_headers(fenxi_auth)
-            async with self._client() as client:
+            async with self._client_scope("fenxi") as client:
                 self._apply_auth(client, fenxi_auth)
                 await self._fenxi_module_switch(client, auth_headers)
                 probe_data = await self._fenxi_render_data(client, PC_MEMBER_COMPONENT_TOTAL, payload_probe, auth_headers)
@@ -389,7 +418,7 @@ class PCWebMetricsService:
         payload_total_week_single = self._payload_pc_member_total_single(offset - 7)
         auth_headers = self._auth_headers(fenxi_auth)
 
-        async with self._client() as client:
+        async with self._client_scope("fenxi") as client:
             self._apply_auth(client, fenxi_auth)
             await self._fenxi_module_switch(client, auth_headers)
             total_data, first_data, trend_data, total_today_single, total_week_single = await gather_limited(
@@ -439,7 +468,7 @@ class PCWebMetricsService:
             "gameids": "",
         }
 
-        async with self._client() as client:
+        async with self._client_scope("pc") as client:
             self._apply_auth(client, auth)
             resp = await client.post(url, data=data, headers=headers)
 

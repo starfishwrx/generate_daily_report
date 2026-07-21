@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -62,6 +63,56 @@ class RunContext:
     charts_dir: Path
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     shared: dict[str, Any] = field(default_factory=dict)
+
+
+class FailureKind(str, Enum):
+    CONFIG_MISSING = "config_missing"
+    NETWORK_UNREACHABLE = "network_unreachable"
+    LOGIN_REQUIRED = "login_required"
+    PERMISSION_DENIED = "permission_denied"
+    UPSTREAM_ERROR = "upstream_error"
+    DATA_INVALID = "data_invalid"
+    CANCELLED = "cancelled"
+    UNKNOWN = "unknown"
+
+
+class SourceError(RuntimeError):
+    def __init__(self, source: str, kind: FailureKind, message: str, *, action: str = "") -> None:
+        self.source = source
+        self.kind = kind
+        self.action = action
+        super().__init__(message)
+
+
+@dataclass
+class PreflightSnapshot:
+    source: str
+    ok: bool
+    message: str = ""
+    reusable_responses: dict[str, Any] = field(default_factory=dict)
+    module_switch_completed: bool = False
+
+
+@dataclass(frozen=True)
+class PublishIntent:
+    target: str
+    content_hash: str
+    report_date: date
+
+
+class PublishResolution(str, Enum):
+    COMPLETED = "completed"
+    RETRY = "retry"
+    HOLD = "hold"
+
+
+@dataclass
+class RunOutcome:
+    status: str
+    artifacts: dict[str, Path] = field(default_factory=dict)
+    publish_urls: dict[str, str] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+    stage_results: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
