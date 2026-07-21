@@ -4,6 +4,7 @@ import copy
 import re
 import shutil
 import sys
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ from app_paths import AppPaths
 SCHEMA_VERSION = "1.4"
 PLACEHOLDER_RE = re.compile(r"(?:<[^>]+>|%3c[^%]+%3e|your[_-]|replace[_-]?me|example\.com)", re.I)
 PERSONAL_TOP_LEVEL_KEYS = {"session_cookie", "feishu_doc", "wecom_bot", "schedule"}
+HTTPS_ONLY_HOSTS = {"admin.buke999.com"}
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,17 @@ class ConfigMigrationResult:
 
 def contains_placeholder(value: object) -> bool:
     return bool(PLACEHOLDER_RE.search(str(value or "")))
+
+
+def normalize_company_endpoints(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Upgrade endpoints that no longer support authenticated HTTP sessions."""
+    payload = copy.deepcopy(dict(config))
+    for key in ("base_url", "login_url_870"):
+        value = str(payload.get(key) or "").strip()
+        parsed = urllib.parse.urlsplit(value)
+        if parsed.hostname and parsed.hostname.lower() in HTTPS_ONLY_HOSTS and parsed.scheme.lower() == "http":
+            payload[key] = urllib.parse.urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, parsed.fragment))
+    return payload
 
 
 def find_internal_defaults(paths: AppPaths) -> Path | None:
@@ -46,7 +59,7 @@ def migrate_internal_config(paths: AppPaths) -> ConfigMigrationResult:
     if defaults_path is None:
         return ConfigMigrationResult(message="未找到内部分发默认配置。")
 
-    defaults = _load_yaml(defaults_path)
+    defaults = normalize_company_endpoints(_load_yaml(defaults_path))
     current = _load_yaml(paths.config) if paths.config.exists() else {}
     merged = copy.deepcopy(defaults)
     for key in PERSONAL_TOP_LEVEL_KEYS:

@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 from app_paths import AppPaths
-from config_migration import migrate_internal_config
+from config_migration import migrate_internal_config, normalize_company_endpoints
 from scripts.prepare_internal_defaults import sanitize_config
 
 
@@ -107,3 +107,13 @@ def test_internal_distribution_scrubs_secrets_and_rejects_placeholders() -> None
     config["base_url"] = "http://<YOUR_870_HOST>/"
     with pytest.raises(ValueError, match="base_url"):
         sanitize_config(config)
+
+
+def test_known_870_endpoint_is_upgraded_to_https() -> None:
+    config = {
+        "base_url": "http://admin.buke999.com/?m=sdk&ac=getToolPre",
+        "login_url_870": "http://admin.buke999.com/?m=user&ac=login",
+    }
+    normalized = normalize_company_endpoints(config)
+    assert normalized["base_url"].startswith("https://")
+    assert normalized["login_url_870"].startswith("https://")

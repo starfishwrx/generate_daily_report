@@ -2,9 +2,9 @@
 # Copy to config.yaml for local use.
 
 # 870 data endpoint (replace with your own internal endpoint)
-base_url: "http://<YOUR_870_HOST>/?m=sdk&ac=getToolPre"
+base_url: "https://<YOUR_870_HOST>/?m=sdk&ac=getToolPre"
 # Optional: explicit 870 login page URL used by GUI launcher button
-login_url_870: "http://<YOUR_870_HOST>/?m=user&ac=login"
+login_url_870: "https://<YOUR_870_HOST>/?m=user&ac=login"
 
 # Local session cookie (do not commit real value)
 session_cookie: "PHPSESSID=<YOUR_SESSION_ID>"

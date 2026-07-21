@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import shutil
 import sys
 import urllib.parse
@@ -14,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from config_migration import contains_placeholder  # noqa: E402
+from config_migration import contains_placeholder, normalize_company_endpoints  # noqa: E402
 
 
 REQUIRED_PATHS = (
@@ -33,7 +32,7 @@ SECRET_KEY_PARTS = ("password", "secret", "authorization", "cookie", "token", "b
 
 
 def sanitize_config(config: Mapping[str, Any]) -> dict[str, Any]:
-    payload = copy.deepcopy(dict(config))
+    payload = normalize_company_endpoints(config)
     if not str(payload.get("login_url_870") or "").strip():
         base = str(payload.get("base_url") or "").strip()
         parsed = urllib.parse.urlsplit(base)
