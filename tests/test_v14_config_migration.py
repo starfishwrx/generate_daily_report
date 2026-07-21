@@ -116,4 +116,4 @@ def test_known_870_endpoint_is_upgraded_to_https() -> None:
     }
     normalized = normalize_company_endpoints(config)
     assert normalized["base_url"].startswith("https://")
-    assert normalized["login_url_870"].startswith("https://")
+    assert normalized["login_url_870"] == "https://admin.buke999.com"

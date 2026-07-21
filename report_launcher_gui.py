@@ -1121,8 +1121,9 @@ class ReportLauncherApp:
             "--config",
             str(self.config_path),
             "--date",
-            self.date_value.get().strip(),
+            date.today().isoformat(),
             "--no-runtime-gui",
+            "--no-publish",
             "--with-extra-metrics",
             "--extra-auth-file",
             str(self._extra_auth_path()),
@@ -1136,7 +1137,7 @@ class ReportLauncherApp:
             "--auth-repair-target",
             "all",
         )
-        self.status_text.set("首次设置：请在打开的 Chrome 中依次完成登录")
+        self.status_text.set("首次设置：仅登录并检查连接，不会生成或发送日报")
         self._run_aux_command("首次设置", cmd)
 
     def start_auth_recovery_and_retry(self) -> None:

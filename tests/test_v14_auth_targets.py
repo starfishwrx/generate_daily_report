@@ -33,3 +33,12 @@ def test_stale_cookie_does_not_complete_before_login_redirect() -> None:
     assert _browser_login_completed(context, "http://admin.internal/?m=user&ac=login") is False
     context.pages[0].url = "http://admin.internal/?m=index&ac=dashboard"
     assert _browser_login_completed(context, "http://admin.internal/?m=user&ac=login") is True
+
+
+def test_root_login_url_rejects_html_redirect_to_login() -> None:
+    page = SimpleNamespace(
+        url="https://admin.buke999.com",
+        content=lambda: "<script>top.window.location.href='https://admin.buke999.com/?ac=login';</script>",
+    )
+    context = SimpleNamespace(pages=[page])
+    assert _browser_login_completed(context, "https://admin.buke999.com") is False

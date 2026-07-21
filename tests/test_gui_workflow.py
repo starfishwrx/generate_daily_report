@@ -71,6 +71,9 @@ class GuiWorkflowTests(unittest.TestCase):
         self.assertEqual(captured["label"], "首次设置")
         self.assertIn("all", captured["cmd"])
         self.assertIn("--repair-auth-only", captured["cmd"])
+        self.assertIn("--no-publish", captured["cmd"])
+        date_index = captured["cmd"].index("--date") + 1
+        self.assertEqual(captured["cmd"][date_index], date.today().isoformat())
 
 
 if __name__ == "__main__":

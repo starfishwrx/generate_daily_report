@@ -39,8 +39,11 @@ def normalize_company_endpoints(config: Mapping[str, Any]) -> dict[str, Any]:
     for key in ("base_url", "login_url_870"):
         value = str(payload.get(key) or "").strip()
         parsed = urllib.parse.urlsplit(value)
-        if parsed.hostname and parsed.hostname.lower() in HTTPS_ONLY_HOSTS and parsed.scheme.lower() == "http":
-            payload[key] = urllib.parse.urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, parsed.fragment))
+        if parsed.hostname and parsed.hostname.lower() in HTTPS_ONLY_HOSTS:
+            if key == "login_url_870":
+                payload[key] = urllib.parse.urlunsplit(("https", parsed.netloc, "", "", ""))
+            elif parsed.scheme.lower() == "http":
+                payload[key] = urllib.parse.urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, parsed.fragment))
     return payload
 
 

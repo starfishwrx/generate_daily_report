@@ -556,6 +556,16 @@ def _browser_login_completed(context: Any, login_url: str) -> bool:
         path = parsed.path.rstrip("/").lower()
         if action == "login" or path.endswith("/login") or path.endswith("/oauth"):
             continue
+        content_fn = getattr(page, "content", None)
+        if callable(content_fn):
+            try:
+                html = str(content_fn() or "").lower()
+            except Exception:  # noqa: BLE001
+                html = ""
+            redirects_to_login = "ac=login" in html and "location.href" in html
+            renders_login_form = "ac=login" in html and ("type=\"password\"" in html or "type='password'" in html)
+            if redirects_to_login or renders_login_form:
+                continue
         return True
     return False
 
