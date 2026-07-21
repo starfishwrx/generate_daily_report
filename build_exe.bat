@@ -4,6 +4,11 @@ setlocal
 set "APP_VERSION=1.5.0"
 set "RELEASE_DIR=dist\windows-release-v1.5.0"
 
+if /I "%AUTODATAREPORT_INCLUDE_PUBLISH_CONFIG%"=="1" if not defined AUTODATAREPORT_INTERNAL_CONFIG (
+    echo AUTODATAREPORT_INCLUDE_PUBLISH_CONFIG=1 requires AUTODATAREPORT_INTERNAL_CONFIG.
+    goto :fail
+)
+
 where uv >nul 2>&1
 if errorlevel 1 (
     echo uv is required for reproducible builds. Install uv and retry.
@@ -45,7 +50,16 @@ if exist build\autodatareport-gui (
 if exist build\internal rmdir /s /q build\internal
 if defined AUTODATAREPORT_INTERNAL_CONFIG (
     echo Preparing sanitized internal platform defaults...
-    %PYTHON_EXE% scripts\prepare_internal_defaults.py "%AUTODATAREPORT_INTERNAL_CONFIG%" build\internal
+    if /I "%AUTODATAREPORT_INCLUDE_PUBLISH_CONFIG%"=="1" (
+        echo Internal publishing profile enabled.
+        if defined AUTODATAREPORT_PUBLISH_ENV (
+            %PYTHON_EXE% scripts\prepare_internal_defaults.py "%AUTODATAREPORT_INTERNAL_CONFIG%" build\internal --include-publish-settings --publish-env-file "%AUTODATAREPORT_PUBLISH_ENV%" --publish-revision 1
+        ) else (
+            %PYTHON_EXE% scripts\prepare_internal_defaults.py "%AUTODATAREPORT_INTERNAL_CONFIG%" build\internal --include-publish-settings --publish-revision 1
+        )
+    ) else (
+        %PYTHON_EXE% scripts\prepare_internal_defaults.py "%AUTODATAREPORT_INTERNAL_CONFIG%" build\internal
+    )
     if errorlevel 1 goto :fail
 ) else (
     echo Public build: AUTODATAREPORT_INTERNAL_CONFIG is not set.
@@ -70,7 +84,11 @@ xcopy /e /i /y dist\autodatareport-gui\_internal\* "%RELEASE_DIR%\_internal\" >n
 if errorlevel 1 goto :fail
 
 echo Writing release manifest and hashes...
-%PYTHON_EXE% scripts\write_release_manifest.py "%RELEASE_DIR%" "%APP_VERSION%"
+if /I "%AUTODATAREPORT_INCLUDE_PUBLISH_CONFIG%"=="1" (
+    %PYTHON_EXE% scripts\write_release_manifest.py "%RELEASE_DIR%" "%APP_VERSION%" --allow-internal-publish-config
+) else (
+    %PYTHON_EXE% scripts\write_release_manifest.py "%RELEASE_DIR%" "%APP_VERSION%"
+)
 if errorlevel 1 goto :fail
 
 echo Build finished.

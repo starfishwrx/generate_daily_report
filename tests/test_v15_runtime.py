@@ -27,7 +27,7 @@ from feishu_doc import FeishuDocError, FeishuDocSettings, _request_with_retry, p
 from generate_daily_report import CHART_RENDERER_SCHEMA, auth_repair_enabled, collect_series_for_queries
 from pc_web_metrics_service import PCWebMetricsService, PCWebSettings
 from publish_state import PUBLISH_STATE_SCHEMA, PublishStateStore, PublishStatus, UncertainPublishError
-from scripts.write_release_manifest import contains_sensitive_value
+from scripts.write_release_manifest import contains_sensitive_value, contains_unapproved_internal_secret
 
 
 def test_atomic_write_preserves_original_when_replace_fails(tmp_path: Path) -> None:
@@ -340,6 +340,26 @@ def test_release_sensitive_scan_distinguishes_empty_and_real_credentials(tmp_pat
     assert not contains_sensitive_value(clean)
     assert not contains_sensitive_value(example)
     assert contains_sensitive_value(secret)
+
+
+def test_internal_publish_manifest_allows_only_designated_publish_secrets(tmp_path: Path) -> None:
+    internal = tmp_path / "company-defaults.yaml"
+    internal.write_text(
+        "feishu_doc:\n  app_secret: app-secret\n"
+        "wecom_bot:\n  secret: bot-secret\n"
+        "session_cookie: ''\n",
+        encoding="utf-8",
+    )
+    assert contains_sensitive_value(internal)
+    assert not contains_unapproved_internal_secret(internal)
+
+    internal.write_text(
+        "feishu_doc:\n  app_secret: app-secret\n"
+        "wecom_bot:\n  secret: bot-secret\n"
+        "session_cookie: PHPSESSID=must-not-ship\n",
+        encoding="utf-8",
+    )
+    assert contains_unapproved_internal_secret(internal)
 
 
 def test_explicit_false_environment_disables_configured_auto_repair(monkeypatch: pytest.MonkeyPatch) -> None:

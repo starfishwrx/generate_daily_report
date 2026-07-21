@@ -239,6 +239,17 @@ dist\windows-release-v1.5.0\
 
 内部分发构建可通过 `AUTODATAREPORT_INTERNAL_CONFIG` 指定公司默认配置源。构建脚本只写入经过清理的平台默认值，不应复制个人认证信息。
 
+需要让内部同事开箱即用飞书和企微时，必须显式生成内部发布版：
+
+```powershell
+$env:AUTODATAREPORT_INTERNAL_CONFIG = "C:\secure\company-config.yaml"
+$env:AUTODATAREPORT_INCLUDE_PUBLISH_CONFIG = "1"
+$env:AUTODATAREPORT_PUBLISH_ENV = "C:\secure\.env.scheduler"
+.\build_exe.bat
+```
+
+内部发布版会携带组织共享的飞书应用密钥、企微机器人密钥和接收目标，但仍会清除 870 Cookie、Fenxi/PC 登录 Token、个人认证文件和历史输出。该目录只能通过内部可信渠道分发，不应上传到公开 GitHub Release。
+
 ## 常见问题
 
 ### 870 提示登录态不可用

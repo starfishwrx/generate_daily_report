@@ -19,6 +19,7 @@ from autodatareport.atomic_io import atomic_write_text, atomic_write_yaml
 SCHEMA_VERSION = "1.5"
 PLACEHOLDER_RE = re.compile(r"(?:<[^>]+>|%3c[^%]+%3e|your[_-]|replace[_-]?me|example\.com)", re.I)
 PERSONAL_TOP_LEVEL_KEYS = {"session_cookie", "feishu_doc", "wecom_bot", "schedule"}
+PUBLISH_SECTIONS = ("feishu_doc", "wecom_bot")
 HTTPS_ONLY_HOSTS = {"admin.buke999.com"}
 
 
@@ -73,6 +74,7 @@ def migrate_internal_config(paths: AppPaths) -> ConfigMigrationResult:
 
     cookie = str(current.get("session_cookie") or "").strip()
     merged["session_cookie"] = "" if contains_placeholder(cookie) else cookie
+    _install_publish_defaults_once(current, defaults, merged)
     merged["config_schema_version"] = SCHEMA_VERSION
 
     changed = merged != current
@@ -109,6 +111,46 @@ def _overlay_managed_defaults(current: Mapping[str, Any], defaults: Mapping[str,
         else:
             merged[key] = copy.deepcopy(default_value)
     return merged
+
+
+def _install_publish_defaults_once(
+    current: Mapping[str, Any],
+    defaults: Mapping[str, Any],
+    merged: dict[str, Any],
+) -> None:
+    """Install organization publish settings once without replacing configured user credentials."""
+
+    default_revision = _revision(defaults.get("internal_publish_revision"))
+    current_revision = _revision(current.get("internal_publish_revision"))
+    if default_revision <= current_revision:
+        return
+    for section in PUBLISH_SECTIONS:
+        shipped = defaults.get(section)
+        existing = current.get(section)
+        if not isinstance(shipped, Mapping):
+            continue
+        if _publish_credentials_configured(section, existing):
+            merged[section] = copy.deepcopy(existing)
+        else:
+            merged[section] = copy.deepcopy(dict(shipped))
+    merged["internal_publish_revision"] = default_revision
+
+
+def _revision(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _publish_credentials_configured(section: str, value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    if section == "feishu_doc":
+        return bool(str(value.get("app_id") or "").strip() and str(value.get("app_secret") or "").strip())
+    if section == "wecom_bot":
+        return bool(str(value.get("bot_id") or "").strip() and str(value.get("secret") or "").strip())
+    return False
 
 
 def _changed_paths(before: Mapping[str, Any], after: Mapping[str, Any], prefix: str = "") -> list[str]:

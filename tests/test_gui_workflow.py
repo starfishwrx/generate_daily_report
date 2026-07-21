@@ -35,6 +35,16 @@ class GuiWorkflowTests(unittest.TestCase):
         app.status_text = FakeVar("")
         app._build_cli_command = lambda *args: ["cli", *args]
         app._append_auth_repair_args = lambda cmd, target="auto": cmd.append("--repair")
+        app._load_config = lambda: {
+            "feishu_doc": {"enabled": True, "app_id": "id", "app_secret": "secret"},
+            "wecom_bot": {
+                "enabled": True,
+                "bot_id": "bot",
+                "secret": "secret",
+                "auto_targets": ["group"],
+            },
+        }
+        app._load_scheduler_env = lambda: {}
         return app
 
     def test_default_summary_describes_one_click_flow(self) -> None:
@@ -53,6 +63,16 @@ class GuiWorkflowTests(unittest.TestCase):
         self.assertNotIn("--no-push-feishu-doc", command)
         app._update_option_summary()
         self.assertEqual(app.run_button_text.get(), "仅生成昨天日报")
+
+    def test_summary_does_not_claim_publish_when_distribution_has_no_credentials(self) -> None:
+        app = self.make_app()
+        app._load_config = lambda: {
+            "feishu_doc": {"enabled": False},
+            "wecom_bot": {"enabled": False},
+        }
+        app._update_option_summary()
+        self.assertEqual(app.run_button_text.get(), "仅生成昨天日报")
+        self.assertIn("未配置发送", app.option_summary_text.get())
 
     def test_gui_enables_v14_event_stream_and_global_limit(self) -> None:
         command = self.make_app()._build_command()

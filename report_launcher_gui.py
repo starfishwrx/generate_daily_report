@@ -607,9 +607,17 @@ class ReportLauncherApp:
         return cmd
 
     def _update_option_summary(self) -> None:
+        channels, publish_incomplete = self._configured_publish_channels()
         parts = ["完整数据" if self.with_extra.get() else "基础数据"]
-        parts.append("仅生成，不发送" if self.disable_feishu.get() else "自动发送飞书 / 企微")
-        if self.verify_feishu.get():
+        if self.disable_feishu.get():
+            parts.append("仅生成，不发送")
+        elif channels:
+            parts.append("自动发送" + " / ".join(channels))
+        elif publish_incomplete:
+            parts.append("仅生成（发布配置不完整）")
+        else:
+            parts.append("仅生成（未配置发送）")
+        if self.verify_feishu.get() and "飞书" in channels:
             parts.append("发送后校验")
         if self.auto_auth_recover.get():
             parts.append("登录失效自动修复")
@@ -622,8 +630,34 @@ class ReportLauncherApp:
             date_label = "昨天"
         else:
             date_label = value or "所选日期"
-        action = "仅生成" if self.disable_feishu.get() else "生成并发送"
+        action = "生成并发送" if channels and not self.disable_feishu.get() else "仅生成"
         self.run_button_text.set(f"{action}{date_label}日报")
+
+    def _configured_publish_channels(self) -> tuple[list[str], bool]:
+        config = self._load_config()
+        env = self._load_scheduler_env()
+        channels: list[str] = []
+        incomplete = False
+
+        feishu = config.get("feishu_doc") if isinstance(config.get("feishu_doc"), dict) else {}
+        if isinstance(feishu, dict) and bool(feishu.get("enabled")):
+            app_id = str(env.get("FEISHU_APP_ID") or feishu.get("app_id") or "").strip()
+            app_secret = str(env.get("FEISHU_APP_SECRET") or feishu.get("app_secret") or "").strip()
+            if app_id and app_secret:
+                channels.append("飞书")
+            else:
+                incomplete = True
+
+        wecom = config.get("wecom_bot") if isinstance(config.get("wecom_bot"), dict) else {}
+        if isinstance(wecom, dict) and bool(wecom.get("enabled")):
+            bot_id = str(env.get("WECOM_BOT_ID") or wecom.get("bot_id") or "").strip()
+            secret = str(env.get("WECOM_BOT_SECRET") or wecom.get("secret") or "").strip()
+            targets = [str(value).strip() for value in (wecom.get("auto_targets") or []) if str(value).strip()]
+            if bot_id and secret and targets:
+                channels.append("企微")
+            else:
+                incomplete = True
+        return channels, incomplete
 
     def _refresh_source_status(self) -> None:
         states = validate_configuration(self._load_config())
