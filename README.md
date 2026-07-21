@@ -1,257 +1,274 @@
-# 云游戏日报自动化工具（V1.5）
+# 云游戏日报自动化工具 V1.5
 
-自动抓取多个后台数据统计，并制作可视化表格，渲染合并成一整份完整的数据日报
+AutoDataReport 是面向日常运营的数据日报工具：从 870、Fenxi、505 和 PC Web 后台采集数据，计算指标、生成主日报与 PC 日报，并按配置发布到飞书和企业微信。
 
-## 项目功能
-- 拉取后台多条线路数据，输出总览日报与 PC 日报。
-- 自动计算并发峰值、排队峰值、排队时段，并生成趋势图。
-- 拉取 后台2 扩展指标：新增、活跃、会员付费率、会员充值、会员数。
-- 拉取 后台3付费数据并输出两张固定样式图片：页游对比表、手游双列榜单表。
-- 将以上内容整合到同一份日报文本里。
+V1.5 继续采用 Python 3.10+、Tkinter 和 Windows 本地 EXE。默认交互是“昨天、完整数据、自动发送、登录失效自动修复”，普通使用者不需要命令行，也不需要安装数据库或部署服务器。
+
+## 普通同事如何使用
+
+### 第一次使用
+
+1. 解压完整的 Windows 分发目录，不要只复制单个 EXE。
+2. 双击 `autodatareport-gui.exe`。
+3. 打开右上角“设置与修复”，选择“首次设置（推荐）”。
+4. 按程序提示完成各后台登录。
+5. 首次设置只检查登录和连接，不会自动生成或发送日报。
+
+### 每天生成日报
+
+1. 打开 GUI，默认日期已经是昨天。
+2. 点击“生成并发送昨天日报”。
+3. 完成后可直接打开主日报、PC 日报或输出文件夹。
+
+程序默认自动验证登录态。认证失效时会引导修复；技术日志平时折叠，失败时自动展开。运行中的正式日报、首次设置和自动修复都可以停止，关闭窗口时也会清理对应的子进程树。
+
+打包版的个人配置、认证文件、输出和运行状态存放在：
+
+```text
+%LOCALAPPDATA%\AutoDataReport\
+```
+
+升级程序时不要删除这个目录。分发包本身不应包含任何个人 Cookie、Token、Webhook、HAR、认证日志或历史输出。
+
+## V1.5 的主要变化
+
+- 将执行过程组织为认证预检、数据采集、指标计算、报告渲染、外部发布五个阶段。
+- 870、Fenxi/505 和 PC 数据按预算并发采集；单次运行复用 HTTP 客户端和连接池。
+- 870 预检成功的首个查询响应可在正式采集时复用，减少重复请求。
+- GUI 使用统一任务控制器管理正式日报、首次设置和认证修复，支持停止和窗口关闭清理。
+- 飞书主日报、飞书 PC 日报和各企微目标分别记录发布状态，避免一个目标失败覆盖其他目标的成功记录。
+- 发布中断且无法确认远端结果时标记为 `uncertain`，普通运行不会自动重发，需要用户确认。
+- 配置、认证、缓存和发布状态的关键写入改用同目录临时文件加 `os.replace()`。
+- `output/run_metrics/` 记录阶段耗时、请求数、重试、客户端创建、预检响应复用和缓存命中等信息。
+- 图表缓存包含渲染版本和应用版本；V1.5 会使旧版渲染缓存自动失效。
+- Windows CI 检查锁定依赖、Ruff、测试、Python 编译和依赖审计。
+
+## 输出内容
+
+- `output/YYYYMMDD_report.txt`：主日报。
+- `output/YYYYMMDD_pc_report.txt`：PC 云游戏日报。
+- `output/charts/*.png`：870 图表和 505 付费表图片。
+- `output/run_metrics/*.json`：单次运行指标。
+- `output/publish_state/YYYYMMDD.json`：按日期保存的发布状态。
+- `output/auth_repair_logs/`：认证修复日志。
+- `output/scheduler_logs/`：定时任务日志。
+
+运行期实际根目录以 GUI 顶部显示的路径为准。打包版通常位于 `%LOCALAPPDATA%\AutoDataReport`，源码运行默认使用项目目录。
+
+## 发布状态与安全重试
+
+V1.5 发布状态 schema 支持：
+
+| 状态 | 含义 | 下次运行行为 |
+|---|---|---|
+| `pending` | 尚未调用远端 | 可以发送 |
+| `publishing` | 已开始远端调用 | 下次启动按待确认处理 |
+| `failed` | 已确认没有成功 | 可以安全重试 |
+| `uncertain` | 远端可能已经成功 | 阻止自动重发，等待人工确认 |
+| `completed` | 已确认成功 | 相同日期和内容自动跳过 |
+
+不要为了消除错误提示直接删除 `publish_state`。如果 GUI 提示发送结果待确认，应先检查飞书或企微，再选择“已发送，标记完成”或“确认未发送，重新发送”。
+
+`--force-publish` 会明确要求重新发布，仅适合已经确认需要重推的情况。
 
 ## 项目结构
-- `generate_daily_report.py`: 主入口（单命令跑完整日报）。
-- `extra_metrics_service.py`: fenxi/505 数据抓取与解析。
-- `extra_metrics_render.py`: 扩展文案渲染 + 505 图片渲染。
-- `extra_auth.py`: 从 HAR 构建并读取扩展认证信息。
-- `network_hosts.py`: hosts 映射重写。
-- `templates/`: 日报模板。
 
-## 快速开始
-建议 Python 3.10+。
+- `generate_daily_report.py`：兼容 CLI 入口，现有脚本和参数保持可用。
+- `autodatareport/application.py`：当前主应用实现和兼容业务逻辑。
+- `autodatareport/orchestrator.py`：五阶段流水线编排。
+- `autodatareport/pipeline.py`：严格/非严格来源任务和并发执行。
+- `autodatareport/models.py`：运行上下文、错误分类、阶段与发布内部类型。
+- `autodatareport/contracts.py`：数据源、计算、渲染和发布的扩展边界定义。
+- `autodatareport/gui_task_controller.py`：GUI 活动任务、任务编号和停止控制。
+- `autodatareport/process_runner.py`：子进程输出与 Windows 进程树清理。
+- `autodatareport/publishing.py`、`publish_state.py`：发布协调、幂等状态和恢复决策。
+- `autodatareport/atomic_io.py`：JSON、YAML 和文本原子写入。
+- `autodatareport/events.py`：结构化事件与运行指标。
+- `autodatareport/cache.py`：图表和渲染缓存。
+- `extra_metrics_service.py`：Fenxi/505 数据请求与解析。
+- `pc_web_metrics_service.py`：PC Web 数据请求与解析。
+- `extra_auth.py`、`auth_repair.py`：HAR 认证和自动认证修复。
+- `extra_metrics_render.py`：扩展文案和 505 图片渲染。
+- `feishu_doc.py`、`wecom_longbot.py`：飞书文档和企业微信发布。
+- `report_launcher_gui.py`：Tkinter 一键工作台。
+- `templates/`：主日报和 PC 日报模板。
+- `tests/`：兼容、并发、认证、GUI、发布和运行安全测试。
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+## 源码运行
+
+要求 Python 3.10+，推荐使用 `uv` 安装锁定依赖。
+
+### Windows
+
+```powershell
+uv sync --frozen --group dev
+Copy-Item config.example.yaml config.yaml
+Copy-Item extra_auth.example.json extra_auth.json
+uv run python report_launcher_gui.py
 ```
 
-复制本地配置文件：
+### macOS/Linux
 
 ```bash
+uv sync --frozen --group dev
 cp config.example.yaml config.yaml
-cp hosts_870.example.yaml hosts_870.yaml
-cp hosts_505.example.yaml hosts_505.yaml
 cp extra_auth.example.json extra_auth.json
+uv run python report_launcher_gui.py
 ```
 
-## 核心配置说明
-`config.yaml` 重点字段：
-- `base_url`: 870 接口地址。
-- `session_cookie`: 870 登录态（`PHPSESSID=...`）。
-- `network.hosts_yaml_path`: 870 hosts 文件路径。
-- `targets`: 870 线路配置（总/页游/主机/手游/原神等）。
-- `extra_metrics.enabled`: 是否启用 fenxi+505 扩展数据。
-- `extra_metrics.fenxi_base`: fenxi 基地址。
-- `extra_metrics.manage_base`: 505 基地址。
-- `extra_metrics.hosts_yaml_path`: 505 hosts 文件路径。
-- `feishu_doc.enabled`: 是否推送到飞书文档（不填时默认开启）。
-- `feishu_doc.app_id` / `feishu_doc.app_secret`: 飞书自建应用凭证（建议用环境变量提供）。
-- `feishu_doc.folder_token`: 文档创建目录（可选）。
-- `feishu_doc.image_width` / `feishu_doc.narrow_image_width`: 飞书图片展示宽度（默认 `960/760`）。
-- `feishu_doc.prevent_upscale`: 是否禁止小图放大（默认 `true`，推荐保持开启，避免变形）。
+如不使用 `uv`，也可创建 Python 虚拟环境并安装 `requirements.txt`，但正式构建和 CI 以 `uv.lock` 为准。
 
-## 运行方式
-### GUI 启动器（推荐）
-你可以直接用桌面按钮运行，不需要命令行。
+## 核心配置
 
-macOS：
-```bash
-chmod +x scripts/start_gui.command
-./scripts/start_gui.command
-```
+公开仓库只提供脱敏的 `config.example.yaml`。内部分发包可在构建时携带已脱敏的平台地址和 hosts 默认值，用户自己的认证信息仍保存在运行目录。
 
-Windows：
-- 双击 `scripts/start_gui.bat`
+常用配置区域：
 
-启动器功能：
-- 默认选择昨天，点击一次 `生成并发送昨天日报` 即可执行完整流程。
-- 也可切换今天或自定义日期；`本次仅生成，不发送` 会关闭本次所有外部发布。
-- 主界面直接展示任务状态、执行摘要和结果入口，成功后可打开主日报、PC 日报或输出文件夹。
-- 技术日志默认折叠，任务失败时自动展开；运行中可按 `Esc` 停止。
-- 高级运行选项、强制重推与登录修复统一放在右上角菜单，减少日常操作干扰。
+- `base_url`、`login_url_870`、`session_cookie`：870 接口、登录页和 PHPSESSID。
+- `network`：870 的 direct/system/custom 代理和 hosts 映射。
+- `targets`：870 各线路查询配置。
+- `extra_metrics`：Fenxi/505 地址、认证文件、代理和 hosts。
+- `pc_web_metrics`：PC Web 地址、严格模式和会员指标。
+- `auth_repair`：自动登录修复浏览器、独立配置目录和超时。
+- `feishu_doc`：飞书应用、目录、标题和图片宽度。
+- `wecom_bot`：企微机器人、单聊/群聊目标和超时。
+- `schedule`：定时认证准备时间、日报时间和默认日期模式。
 
-可选配置：
-- `config.yaml` 可增加 `login_url_870`，用于覆盖默认登录跳转地址。
+敏感信息优先通过运行目录配置或环境变量提供，不要提交到 Git。
 
-### 命令行
-生成完整日报（870 + 扩展 + 图表）：
+## 常用命令
 
-```bash
-./.venv/bin/python generate_daily_report.py --date 2026-02-20 --with-extra-metrics
-```
+查看版本：
 
-说明：`--with-extra-metrics` 现在会先做 fenxi/505 登录态预检，预检失败会直接中止，避免输出缺失扩展数据的“伪完整”日报。
-
-生成完整日报（默认会推送飞书文档）：
-
-```bash
-FEISHU_APP_ID="cli_xxx" \
-FEISHU_APP_SECRET="xxx" \
-./.venv/bin/python generate_daily_report.py --date 2026-02-20 --with-extra-metrics
-```
-
-可选参数：
-- `--no-push-feishu-doc`: 本次运行禁用飞书推送。
-- `--feishu-folder-token`: 指定飞书目录 token。
-- `--feishu-doc-title`: 指定文档标题（不传则按 `title_prefix_YYYYMMDD` 自动生成）。
-- `--feishu-doc-url-prefix`: 自定义结果链接前缀（默认 `https://www.feishu.cn/docx/`）。
-- `--verify-feishu-content`: 推送后调用 `docs/v1/content` 拉回 markdown 做内容校验（需权限 `docs:document.content:read`）。
-
-仅推送已有报告文件（快速验证，不重跑数据）：
-
-```bash
-FEISHU_APP_ID="cli_xxx" \
-FEISHU_APP_SECRET="xxx" \
-./.venv/bin/python generate_daily_report.py --push-report-file ./output/2026220_report.txt --date 2026-02-20
-```
-
-每日登录态建议流程（手机验证码登录后）：
-
-```bash
-# 1) 用最新 HAR 刷新扩展认证
-./.venv/bin/python generate_daily_report.py \
-  --build-extra-auth \
-  --fenxi-har "/path/to/fenxi.har" \
-  --manage-har "/path/to/manage.har"
-
-# 2) 只做扩展登录态预检（不跑870）
-./.venv/bin/python generate_daily_report.py --check-extra-auth --date 2026-02-20
-
-# 3) 预检通过后再跑正式日报
-./.venv/bin/python generate_daily_report.py --date 2026-02-20 --with-extra-metrics
-```
-
-也可以先一条命令刷新并预检：
-
-```bash
-./.venv/bin/python generate_daily_report.py \
-  --build-extra-auth \
-  --check-extra-auth \
-  --date 2026-02-20
-```
-
-`--extra-auth-max-age-hours` 可设置认证文件老化阈值（默认 24 小时）：
-
-```bash
-./.venv/bin/python generate_daily_report.py --check-extra-auth --extra-auth-max-age-hours 24
-```
-
-## 定时任务（稳定每日推送飞书）
-前提：你每天先完成一次手机验证码登录，刷新当天登录态（`session_cookie` + `extra_auth.json`）。
-
-### macOS（launchd）
-1. 准备调度环境变量：
-```bash
-cp .env.scheduler.example .env.scheduler
-```
-填入真实 `FEISHU_APP_ID/FEISHU_APP_SECRET`。
-
-2. 给脚本执行权限：
-```bash
-chmod +x scripts/run_daily_report.sh scripts/install_macos_launchd.sh
-```
-
-3. 安装每天定时任务（示例：每天 09:10）：
-```bash
-./scripts/install_macos_launchd.sh 9 10
-```
-
-4. 手动触发一次测试：
-```bash
-launchctl kickstart -k gui/$(id -u)/com.starfish.autodatareport.daily
-```
-
-日志位置：
-- `output/scheduler_logs/launchd_stdout.log`
-- `output/scheduler_logs/launchd_stderr.log`
-- `output/scheduler_logs/daily_*.log`
-
-### Windows（任务计划程序）
-1. 先手动验证一次脚本：
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_daily_report.ps1 -DateMode today
+uv run python generate_daily_report.py --version
 ```
 
-2. 创建每日任务（示例：每天 09:10）：
+生成指定日期并按配置发送：
+
 ```powershell
-schtasks /Create /SC DAILY /TN "AutoDataReportDaily" /TR "powershell -ExecutionPolicy Bypass -File C:\path\to\autodatareport\scripts\run_daily_report.ps1 -DateMode today" /ST 09:10
+uv run python generate_daily_report.py --date 2026-07-20 --with-extra-metrics
 ```
 
-3. 立即执行测试：
+只生成和验证，不调用飞书或企微：
+
 ```powershell
-schtasks /Run /TN "AutoDataReportDaily"
+uv run python generate_daily_report.py --date 2026-07-20 --with-extra-metrics --no-publish
 ```
 
-日志位置：
-- `output\scheduler_logs\daily_*.log`
+检查 870、Fenxi/505 和 PC Web 登录态：
 
-脚本特性（macOS/Windows）：
-- 自动做扩展登录态预检（失败直接终止，避免推送错误日报）。
-- 失败自动重试（默认 3 次，间隔 300 秒）。
-- 带运行日志，便于定位问题。
-- macOS 脚本带并发锁，避免重复触发时重入。
-
-## 打包分发（macOS 双版本）
-本项目当前提供两种 macOS 分发包：
-- `CLI`：命令行版（适合服务器/脚本调用）
-- `GUI`：桌面点击版（适合运营同学）
-
-一键构建：
-
-```bash
-chmod +x scripts/build_release_macos.sh
-./scripts/build_release_macos.sh
+```powershell
+uv run python generate_daily_report.py --date 2026-07-20 --check-extra-auth
 ```
 
-构建产物目录：
-- `dist/releases/<timestamp>/autodatareport-cli-macos.zip`
-- `dist/releases/<timestamp>/autodatareport-gui-macos.zip`
+只执行认证修复和预检，不生成日报：
 
-说明：
-- 打包时只包含 `config.example.yaml`，不会打包本地 `config.yaml`、`extra_auth.json` 等敏感文件。
-- Windows `.exe` 需在 Windows 环境打包（保留 `build_exe.bat` 流程）。
-
-### Windows V1.5 一键工作台与运行数据
-
-执行 `build_exe.bat` 会按 `uv.lock` 构建 `dist/windows-release-v1.5.0/`，并生成版本、完整文件清单、文件大小、SHA-256 和敏感文件扫描结果。V1.4 发布目录会完整保留，发布目录不会复制本机的 `config.yaml`、`.env.scheduler`、`extra_auth.json` 或历史输出。
-
-打包版把可变数据放在 `%LOCALAPPDATA%\AutoDataReport\`。首次启动会从旧 `windows-release` 复制已有配置（保留原文件），没有旧配置时则从示例创建。自动任务仍默认推送；本地验证可加 `--no-publish`，手工明确重推可加 `--force-publish`。相同日期、相同内容的成功发布会记录在 `output/publish_state/` 并在重试时跳过。
-
-V1.5 GUI 默认选择昨天、完整数据、自动发送和登录失效自动修复，正常使用只需点击一次“生成并发送昨天日报”。正式日报、首次设置和自动修复统一受停止按钮与窗口关闭逻辑管理。若发送中断且无法确认远端结果，程序会阻止自动重发，并让用户检查后选择“标记完成”或“确认未发送后重试”。
-
-每次执行会在 `output/run_metrics/` 写入阶段耗时、请求数、重试数和图表缓存命中数据。870、扩展指标和 PC 数据会在登录预检后并行采集；主日报与 PC 日报共享一次飞书 tenant token 并行创建，单文档图片上传并发上限为 3。
-
-发布状态继续使用 `output/publish_state/YYYYMMDD.json`，V1.5 schema 支持 `pending`、`publishing`、`failed`、`uncertain` 和 `completed`，无需安装数据库。旧版 completed 状态会自动兼容。
-
-仅跑 870 主报告：
-
-```bash
-./.venv/bin/python generate_daily_report.py --date 2026-02-20
+```powershell
+uv run python generate_daily_report.py --repair-auth-only --auth-repair-target all
 ```
 
-首次接入扩展时，用 HAR 生成认证文件：
+手工从 HAR 构建扩展认证：
 
-```bash
-./.venv/bin/python generate_daily_report.py \
-  --build-extra-auth \
-  --fenxi-har "/path/to/fenxi1.har" \
-  --fenxi-har "/path/to/fenxi2.har" \
-  --manage-har "/path/to/manage505.har"
+```powershell
+uv run python generate_daily_report.py `
+  --build-extra-auth-only `
+  --fenxi-har "C:\path\fenxi.har" `
+  --manage-har "C:\path\manage.har"
 ```
 
-## 产物输出
-- `output/YYYYMMDD_report.txt`: 总览日报（含扩展备注与图片路径）。
-- `output/YYYYMMDD_pc_report.txt`: PC 云游戏日报。
-- `output/charts/*.png`: 870 图表 + 505 两张付费表图。
-  - `505_page_payment_table_YYYYMMDD.png`
-  - `505_mobile_payment_table_YYYYMMDD.png`
+输出给 GUI 使用的 JSONL 事件：
+
+```powershell
+uv run python generate_daily_report.py --date 2026-07-20 --event-stream jsonl --no-publish
+```
+
+完整参数以程序输出为准：
+
+```powershell
+uv run python generate_daily_report.py --help
+```
+
+## 定时任务
+
+Windows 调度脚本位于 `scripts/run_daily_report.ps1`。先手工验证：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_daily_report.ps1 -DateMode yesterday
+```
+
+再使用 Windows 任务计划程序调用同一脚本。定时任务会先准备或验证认证状态，再运行日报；日志写入 `output/scheduler_logs/`。
+
+macOS 仍保留 `scripts/install_macos_launchd.sh` 和 `scripts/run_daily_report.sh`，但 V1.5 的主要分发目标是 Windows EXE。
+
+## 测试与质量检查
+
+```powershell
+uv sync --frozen --group dev
+uv run python -m ruff check .
+uv run python -m pytest -q
+uv run python -m compileall -q .
+uv run python -m pip_audit
+```
+
+当前 V1.5 基线为 65 项测试通过。自动化测试不会访问真实内部平台，也不会向正式飞书或企微发送报告。
+
+## Windows 构建
+
+```powershell
+.\build_exe.bat
+```
+
+构建产物：
+
+```text
+dist\windows-release-v1.5.0\
+├─ autodatareport-gui.exe
+├─ autodatareport-cli.exe
+├─ _internal\
+└─ release-manifest.json
+```
+
+构建脚本会：
+
+- 从 `uv.lock` 同步固定构建依赖。
+- 分别构建 CLI 和 GUI，再合并运行依赖。
+- 保留旧版发布目录，不覆盖 V1.4。
+- 生成完整文件清单、大小和 SHA-256。
+- 扫描分发目录中的敏感文件名和已知敏感字段。
+
+内部分发构建可通过 `AUTODATAREPORT_INTERNAL_CONFIG` 指定公司默认配置源。构建脚本只写入经过清理的平台默认值，不应复制个人认证信息。
 
 ## 常见问题
-- 870 返回登录页：`session_cookie` 失效，重新登录后更新 `config.yaml`。
-- fenxi/505 失败：检查 `extra_auth.json`、hosts 配置、是否需要重新抓 HAR。
-- 扩展登录态当天可用但次日失效：先手机验证码登录，再执行 `--build-extra-auth` + `--check-extra-auth`。
-- 无法弹 GUI：无图形环境是正常现象，脚本会自动跳过 GUI 输入框。
 
-## 安全注意
-- 不要提交这些本地敏感文件：`config.yaml`、`extra_auth.json`、`hosts_*.yaml`、`*.har`、`output/`。
+### 870 提示登录态不可用
+
+通过 GUI 右上角“设置与修复”更新 870 登录态。默认已知登录后台使用 HTTPS；修复完成后程序仍会执行真实预检，Cookie 无效时不会继续生成伪完整日报。
+
+### Fenxi、505 或 PC Web 首次配置失败
+
+优先运行 GUI 的“首次设置（推荐）”。HAR 导入是手工回退方式，不建议非技术用户直接编辑 `extra_auth.json`。
+
+### 程序提示发送结果待确认
+
+说明远端可能已经成功，但本地没有拿到最终确认。先打开飞书或企微检查，不要直接强制重推。
+
+### 停止任务后仍有浏览器窗口
+
+正式日报、首次设置和自动修复会清理其进程树。若浏览器不是由程序启动，程序不会关闭用户原有浏览器会话。
+
+### GitHub 推送连接超时
+
+如果 Windows 系统代理指向本地端口，应确认代理客户端正在运行并实际监听该端口；Git 也需要配置相同的 `http.proxy`/`https.proxy`，否则可能回退到不可达的直连路径。
+
+## 不应提交的文件
+
+- `config.yaml`
+- `extra_auth.json`
+- `.env.scheduler`
+- `hosts_*.yaml`
+- `*.har`
+- `output/`
+- Cookie、PHPSESSID、Authorization、e_token、Admin-Token、Webhook 或其他 Token
+
+发布包同样不得包含个人认证文件、认证日志和历史输出。
