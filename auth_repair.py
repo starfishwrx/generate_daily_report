@@ -210,6 +210,9 @@ def merge_repaired_auth(
 
 
 def recover_auth_with_chrome_profile(settings: AuthRepairSettings) -> Dict[str, Any]:
+    # Playwright's bundled Node runtime may emit DEP0169 for its own legacy URL code.
+    # It is not actionable for users and obscures the login instructions.
+    os.environ.setdefault("NODE_NO_WARNINGS", "1")
     try:
         from playwright.sync_api import sync_playwright
     except Exception as exc:  # noqa: BLE001
@@ -284,11 +287,13 @@ def recover_auth_with_chrome_profile(settings: AuthRepairSettings) -> Dict[str, 
                 if "870" in targets and not session_cookie_870:
                     cookie_map = _extract_cookies(cookies, _hosts_from_urls(settings.login_url_870))
                     raw_session = str(cookie_map.get("PHPSESSID") or "").strip()
-                    if raw_session:
+                    if raw_session and _browser_login_completed(context, settings.login_url_870):
                         session_cookie_870 = f"PHPSESSID={raw_session}"
+                    elif raw_session:
+                        last_message = "已发现旧 870 Cookie，等待登录页面成功跳转"
                 if "505" in targets and manage_block is None:
                     manage_cookies = _extract_cookies(cookies, _hosts_from_urls(settings.manage_login_url))
-                    if manage_cookies:
+                    if manage_cookies and _browser_login_completed(context, settings.manage_login_url):
                         existing_manage = existing.get("505") if isinstance(existing.get("505"), dict) else {}
                         manage_block = {
                             "cookies": manage_cookies,
@@ -534,6 +539,25 @@ def _url_host(url: str) -> str:
         return urllib.parse.urlsplit(str(url or "")).netloc.lower()
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _browser_login_completed(context: Any, login_url: str) -> bool:
+    """Require a target-domain page that is no longer showing a login route."""
+    wanted_host = _url_host(login_url)
+    if not wanted_host:
+        return False
+    for page in list(getattr(context, "pages", []) or []):
+        current = str(getattr(page, "url", "") or "")
+        if _url_host(current) != wanted_host:
+            continue
+        parsed = urllib.parse.urlsplit(current)
+        query = urllib.parse.parse_qs(parsed.query)
+        action = str((query.get("ac") or [""])[0]).strip().lower()
+        path = parsed.path.rstrip("/").lower()
+        if action == "login" or path.endswith("/login") or path.endswith("/oauth"):
+            continue
+        return True
+    return False
 
 
 def _pc_probe_urls(settings: AuthRepairSettings) -> List[str]:

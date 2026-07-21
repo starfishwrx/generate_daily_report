@@ -1,4 +1,6 @@
-from auth_repair import _extract_cookies, _hosts_from_urls, resolve_repair_targets
+from types import SimpleNamespace
+
+from auth_repair import _browser_login_completed, _extract_cookies, _hosts_from_urls, resolve_repair_targets
 from generate_daily_report import select_auth_repair_target
 
 
@@ -24,3 +26,10 @@ def test_runtime_retry_opens_the_failed_platform() -> None:
     assert select_auth_repair_target(["870"]) == "870"
     assert select_auth_repair_target(["505"]) == "505"
     assert select_auth_repair_target(["fenxi", "pc_web"]) == "both"
+
+
+def test_stale_cookie_does_not_complete_before_login_redirect() -> None:
+    context = SimpleNamespace(pages=[SimpleNamespace(url="http://admin.internal/?m=user&ac=login")])
+    assert _browser_login_completed(context, "http://admin.internal/?m=user&ac=login") is False
+    context.pages[0].url = "http://admin.internal/?m=index&ac=dashboard"
+    assert _browser_login_completed(context, "http://admin.internal/?m=user&ac=login") is True
