@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Style B - Bold Signal</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=Manrope:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; }
+    body {
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(circle at 20% 20%, rgba(255,128,0,.18), transparent 30%),
+        radial-gradient(circle at 80% 30%, rgba(255,90,31,.18), transparent 30%),
+        linear-gradient(135deg, #121212 0%, #1f1f1f 55%, #141414 100%);
+      font-family: "Manrope", "Noto Sans SC", sans-serif;
+    }
+    .slide {
+      width: min(92vw, 1320px);
+      height: min(88vh, 820px);
+      border-radius: 2rem;
+      position: relative;
+      overflow: hidden;
+      padding: clamp(2rem, 3.5vw, 3.4rem);
+      display: grid;
+      grid-template-columns: 1.2fr .8fr;
+      align-items: end;
+      gap: 1.6rem;
+      border: 1px solid rgba(255,255,255,.08);
+      box-shadow: 0 30px 80px rgba(0,0,0,.45);
+    }
+    .number {
+      position: absolute; left: 2.2rem; top: 2rem;
+      font-family: "Archivo Black", sans-serif;
+      font-size: clamp(3rem, 6vw, 5.6rem);
+      color: rgba(255,255,255,.15);
+      line-height: 1;
+    }
+    .crumb {
+      position: absolute; right: 2.3rem; top: 2.2rem;
+      color: rgba(255,255,255,.72);
+      letter-spacing: .26em;
+      font-size: clamp(.7rem, 1vw, .9rem);
+      text-transform: uppercase;
+    }
+    .panel {
+      background: linear-gradient(180deg, #ff7a1c 0%, #ff5c1a 100%);
+      color: #111;
+      border-radius: 1.8rem;
+      padding: clamp(2rem, 3vw, 3rem);
+      min-height: 62%;
+      display: flex;
+      flex-direction: column;
+      justify-content: end;
+    }
+    h1 {
+      font-family: "Archivo Black", "Noto Sans SC", sans-serif;
+      font-size: clamp(2.7rem, 5.8vw, 5.8rem);
+      line-height: .92;
+      max-width: 7ch;
+    }
+    p {
+      color: rgba(255,255,255,.82);
+      font-size: clamp(1rem, 1.45vw, 1.2rem);
+      line-height: 1.55;
+      max-width: 24rem;
+      margin-bottom: 2rem;
+      align-self: end;
+    }
+    .label {
+      display: inline-flex;
+      align-self: start;
+      margin-top: 1rem;
+      padding: .7rem 1rem;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,.14);
+      color: rgba(255,255,255,.85);
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      font-size: clamp(.72rem, .9vw, .88rem);
+    }
+  </style>
+</head>
+<body>
+  <section class="slide">
+    <div class="number">02</div>
+    <div class="crumb">Style B / Bold Signal</div>
+    <div class="panel">
+      <h1>把结果、结论和态度都打在第一页。</h1>
+    </div>
+    <div style="display:flex;flex-direction:column;justify-content:end;align-items:flex-start;height:100%;">
+      <p>更像发布会和答辩的结合体，适合强调“我做成了什么”，冲击力最强。</p>
+      <span class="label">Confident / High Contrast</span>
+    </div>
+  </section>
+</body>
+</html>

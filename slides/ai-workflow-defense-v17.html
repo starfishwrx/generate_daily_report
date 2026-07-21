@@ -1,0 +1,1552 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>4399职级申报答辩</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Bodoni+Moda:opsz,wght@6..96,600;6..96,700;6..96,800&family=DM+Sans:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700;900&display=swap" rel="stylesheet">
+    <style>
+        /* ===========================================
+           THEME TOKENS
+           =========================================== */
+        :root {
+            --bg-outer: #24211d;
+            --bg-outer-2: #191714;
+            --paper: #f7f2e8;
+            --paper-2: #f1e9da;
+            --paper-line: rgba(76, 59, 39, 0.08);
+            --text-primary: #1e1a16;
+            --text-secondary: #5e5448;
+            --text-muted: #8f8578;
+            --accent: #c56a2c;
+            --accent-deep: #9d4f1f;
+            --accent-soft: rgba(197, 106, 44, 0.12);
+            --tab-green: #abd2c0;
+            --tab-lilac: #cdbde5;
+            --tab-rose: #efc7ce;
+            --shadow-strong: 0 28px 90px rgba(0, 0, 0, 0.28);
+            --font-display: "Bodoni Moda", serif;
+            --font-body: "DM Sans", "Noto Sans SC", sans-serif;
+            --font-cn: "Noto Sans SC", sans-serif;
+            --title-size: clamp(1.5rem, 5vw, 4rem);
+            --h2-size: clamp(1.25rem, 3.5vw, 2.5rem);
+            --h3-size: clamp(1rem, 2.5vw, 1.75rem);
+            --body-size: clamp(0.75rem, 1.5vw, 1.125rem);
+            --small-size: clamp(0.65rem, 1vw, 0.875rem);
+            --slide-padding: clamp(1rem, 4vw, 4rem);
+            --content-gap: clamp(0.5rem, 2vw, 2rem);
+            --element-gap: clamp(0.25rem, 1vw, 1rem);
+            --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+            --duration-normal: 0.6s;
+        }
+
+        /* ===========================================
+           RESET
+           =========================================== */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        /* ===========================================
+           VIEWPORT FITTING: MANDATORY BASE STYLES
+           =========================================== */
+        html, body {
+            height: 100%;
+            overflow-x: hidden;
+        }
+
+        html {
+            scroll-snap-type: y mandatory;
+            scroll-behavior: smooth;
+        }
+
+        .slide {
+            width: 100vw;
+            height: 100vh;
+            height: 100dvh;
+            overflow: hidden;
+            scroll-snap-align: start;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+        }
+
+        .slide-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            max-height: 100%;
+            overflow: hidden;
+            padding: var(--slide-padding);
+        }
+
+        :root {
+            --title-size: clamp(1.5rem, 5vw, 4rem);
+            --h2-size: clamp(1.25rem, 3.5vw, 2.5rem);
+            --h3-size: clamp(1rem, 2.5vw, 1.75rem);
+            --body-size: clamp(0.75rem, 1.5vw, 1.125rem);
+            --small-size: clamp(0.65rem, 1vw, 0.875rem);
+            --slide-padding: clamp(1rem, 4vw, 4rem);
+            --content-gap: clamp(0.5rem, 2vw, 2rem);
+            --element-gap: clamp(0.25rem, 1vw, 1rem);
+        }
+
+        .card, .container, .content-box {
+            max-width: min(90vw, 1000px);
+            max-height: min(80vh, 700px);
+        }
+
+        .feature-list, .bullet-list {
+            gap: clamp(0.4rem, 1vh, 1rem);
+        }
+
+        .feature-list li, .bullet-list li {
+            font-size: var(--body-size);
+            line-height: 1.4;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr));
+            gap: clamp(0.5rem, 1.5vw, 1rem);
+        }
+
+        img, .image-container {
+            max-width: 100%;
+            max-height: min(50vh, 400px);
+            object-fit: contain;
+        }
+
+        @media (max-height: 700px) {
+            :root {
+                --slide-padding: clamp(0.75rem, 3vw, 2rem);
+                --content-gap: clamp(0.4rem, 1.5vw, 1rem);
+                --title-size: clamp(1.25rem, 4.5vw, 2.5rem);
+                --h2-size: clamp(1rem, 3vw, 1.75rem);
+            }
+        }
+
+        @media (max-height: 600px) {
+            :root {
+                --slide-padding: clamp(0.5rem, 2.5vw, 1.5rem);
+                --content-gap: clamp(0.3rem, 1vw, 0.75rem);
+                --title-size: clamp(1.1rem, 4vw, 2rem);
+                --body-size: clamp(0.7rem, 1.2vw, 0.95rem);
+            }
+
+            .nav-dots, .keyboard-hint, .decorative {
+                display: none;
+            }
+        }
+
+        @media (max-height: 500px) {
+            :root {
+                --slide-padding: clamp(0.4rem, 2vw, 1rem);
+                --title-size: clamp(1rem, 3.5vw, 1.5rem);
+                --h2-size: clamp(0.9rem, 2.5vw, 1.25rem);
+                --body-size: clamp(0.65rem, 1vw, 0.85rem);
+            }
+        }
+
+        @media (max-width: 600px) {
+            :root {
+                --title-size: clamp(1.25rem, 7vw, 2.5rem);
+            }
+
+            .grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.01ms !important;
+                transition-duration: 0.2s !important;
+            }
+
+            html {
+                scroll-behavior: auto;
+            }
+        }
+
+        /* ===========================================
+           GLOBAL BACKDROP
+           =========================================== */
+        body {
+            font-family: var(--font-body);
+            color: var(--text-primary);
+            background:
+                radial-gradient(circle at top left, rgba(255, 228, 193, 0.08), transparent 30%),
+                linear-gradient(135deg, var(--bg-outer) 0%, var(--bg-outer-2) 100%);
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            background-image:
+                linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+            background-size: 28px 28px;
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        /* ===========================================
+           ANIMATIONS
+           =========================================== */
+        .reveal,
+        .reveal-left,
+        .reveal-scale,
+        .reveal-blur {
+            opacity: 0;
+        }
+
+        .reveal {
+            transform: translateY(28px);
+            transition: opacity var(--duration-normal) var(--ease-out-expo),
+                        transform var(--duration-normal) var(--ease-out-expo);
+        }
+
+        .reveal-left {
+            transform: translateX(-36px);
+            transition: opacity var(--duration-normal) var(--ease-out-expo),
+                        transform var(--duration-normal) var(--ease-out-expo);
+        }
+
+        .reveal-scale {
+            transform: scale(0.95);
+            transition: opacity var(--duration-normal) var(--ease-out-expo),
+                        transform var(--duration-normal) var(--ease-out-expo);
+        }
+
+        .reveal-blur {
+            filter: blur(8px);
+            transition: opacity calc(var(--duration-normal) + 0.08s) var(--ease-out-expo),
+                        filter calc(var(--duration-normal) + 0.08s) var(--ease-out-expo);
+        }
+
+        .slide.visible .reveal,
+        .slide.visible .reveal-left,
+        .slide.visible .reveal-scale,
+        .slide.visible .reveal-blur {
+            opacity: 1;
+            transform: translateX(0) translateY(0) scale(1);
+            filter: blur(0);
+        }
+
+        .stagger-1 { transition-delay: 0.08s; }
+        .stagger-2 { transition-delay: 0.14s; }
+        .stagger-3 { transition-delay: 0.2s; }
+        .stagger-4 { transition-delay: 0.26s; }
+        .stagger-5 { transition-delay: 0.32s; }
+
+        /* ===========================================
+           PRESENTATION CHROME
+           =========================================== */
+        .progress-bar {
+            position: fixed;
+            inset: 0 auto auto 0;
+            height: 4px;
+            width: 0;
+            background: linear-gradient(90deg, var(--accent), #e09252);
+            z-index: 1000;
+            transition: width 0.25s ease;
+        }
+
+        .nav-dots {
+            position: fixed;
+            top: 50%;
+            right: clamp(0.9rem, 1.5vw, 1.2rem);
+            transform: translateY(-50%);
+            display: flex;
+            flex-direction: column;
+            gap: 0.55rem;
+            z-index: 1000;
+        }
+
+        .nav-dot {
+            width: 11px;
+            height: 11px;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.4);
+            background: transparent;
+            cursor: pointer;
+            transition: transform 0.25s ease, background 0.25s ease, border-color 0.25s ease;
+        }
+
+        .nav-dot.active {
+            background: var(--paper);
+            border-color: var(--paper);
+            transform: scale(1.15);
+        }
+
+        .keyboard-hint {
+            position: fixed;
+            right: clamp(1rem, 2vw, 1.5rem);
+            bottom: clamp(0.8rem, 2vw, 1.3rem);
+            z-index: 1000;
+            padding: 0.65rem 1rem;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.12);
+            color: rgba(255,255,255,0.72);
+            font-size: var(--small-size);
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            background: rgba(255,255,255,0.04);
+            backdrop-filter: blur(10px);
+        }
+
+        .draft-badge {
+            position: fixed;
+            right: clamp(1rem, 2vw, 1.5rem);
+            bottom: clamp(4rem, 7vw, 5rem);
+            z-index: 1000;
+            padding: 0.6rem 0.95rem;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.12);
+            color: rgba(255,255,255,0.72);
+            font-size: var(--small-size);
+        }
+
+        .edit-hotzone {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 80px;
+            height: 80px;
+            z-index: 10000;
+            cursor: pointer;
+        }
+
+        .edit-toggle,
+        .save-button {
+            position: fixed;
+            top: 1rem;
+            z-index: 10001;
+            border: 0;
+            border-radius: 999px;
+            padding: 0.7rem 1rem;
+            font-size: var(--small-size);
+            font-family: var(--font-body);
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            cursor: pointer;
+            transition: opacity 0.3s ease, transform 0.25s ease;
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        .edit-toggle {
+            left: 1rem;
+            background: rgba(255,255,255,0.88);
+            color: #1b1714;
+        }
+
+        .save-button {
+            left: 7.4rem;
+            background: #1b1714;
+            color: var(--paper);
+            border: 1px solid rgba(255,255,255,0.18);
+        }
+
+        .edit-toggle.show,
+        .edit-toggle.active,
+        .save-button.show,
+        .save-button.active {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        /* ===========================================
+           PAGE FRAME
+           =========================================== */
+        .paper {
+            position: relative;
+            width: min(92vw, 1320px);
+            height: min(86vh, 790px);
+            margin: auto;
+            background:
+                linear-gradient(180deg, rgba(255,255,255,0.25), transparent 18%),
+                linear-gradient(180deg, var(--paper) 0%, var(--paper-2) 100%);
+            border-radius: clamp(1.4rem, 2vw, 2rem);
+            box-shadow: var(--shadow-strong);
+            overflow: hidden;
+            border: 1px solid rgba(255,255,255,0.34);
+        }
+
+        .paper::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background-image:
+                linear-gradient(var(--paper-line) 1px, transparent 1px),
+                linear-gradient(90deg, var(--paper-line) 1px, transparent 1px);
+            background-size: 34px 34px;
+            pointer-events: none;
+        }
+
+        .paper-inner {
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+            height: 100%;
+            padding: clamp(1.8rem, 3.8vw, 3.4rem);
+            overflow: hidden;
+            gap: clamp(0.8rem, 1.4vw, 1.15rem);
+        }
+
+        .binder-holes {
+            position: absolute;
+            left: 1rem;
+            top: 10%;
+            bottom: 10%;
+            width: 0.9rem;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-evenly;
+            z-index: 2;
+        }
+
+        .binder-holes span {
+            width: 0.85rem;
+            height: 0.85rem;
+            border-radius: 999px;
+            background: #d8cfbf;
+            box-shadow: inset 0 1px 2px rgba(0,0,0,0.12);
+        }
+
+        .tabs {
+            position: absolute;
+            top: 9%;
+            right: 0;
+            z-index: 3;
+            display: grid;
+            gap: 0.55rem;
+        }
+
+        .tab {
+            writing-mode: vertical-rl;
+            text-orientation: mixed;
+            padding: 0.9rem 0.58rem;
+            border-radius: 0.9rem 0 0 0.9rem;
+            font-size: clamp(0.55rem, 0.85vw, 0.76rem);
+            letter-spacing: 0.15em;
+            font-weight: 700;
+            color: #1b1714;
+            box-shadow: -4px 4px 18px rgba(0,0,0,0.08);
+        }
+
+        .tab.t1 { background: var(--tab-green); }
+        .tab.t2 { background: var(--tab-lilac); }
+        .tab.t3 { background: var(--tab-rose); }
+
+        .topline {
+            display: flex;
+            justify-content: space-between;
+            align-items: start;
+            gap: 1rem;
+        }
+
+        .section-mark {
+            font-size: clamp(0.72rem, 0.9vw, 0.88rem);
+            letter-spacing: 0.28em;
+            text-transform: uppercase;
+            color: var(--accent-deep);
+            font-weight: 700;
+        }
+
+        .page-mark {
+            color: var(--text-muted);
+            font-size: var(--small-size);
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+        }
+
+        .headline {
+            font-family: var(--font-display);
+            font-size: clamp(1.8rem, 4vw, 4.2rem);
+            line-height: 0.98;
+            color: var(--text-primary);
+            letter-spacing: -0.03em;
+        }
+
+        .subline {
+            color: var(--text-secondary);
+            font-size: clamp(0.92rem, 1.25vw, 1.14rem);
+            line-height: 1.55;
+            max-width: 48rem;
+        }
+
+        .title-row {
+            display: flex;
+            flex-direction: column;
+            gap: 0.65rem;
+            padding-left: 2rem;
+            padding-right: 2rem;
+        }
+
+        .module-paper .paper-inner {
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding-left: clamp(2.4rem, 7vw, 8rem);
+            padding-right: clamp(2.4rem, 7vw, 8rem);
+        }
+
+        .module-paper .headline {
+            max-width: 12ch;
+            font-size: clamp(2.8rem, 7vw, 6rem);
+        }
+
+        .module-paper .subline {
+            max-width: 30rem;
+        }
+
+        .cover-paper .paper-inner {
+            justify-content: space-between;
+        }
+
+        .cover-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1.1fr) minmax(270px, 0.9fr);
+            gap: clamp(1.2rem, 2vw, 1.8rem);
+            align-items: end;
+            flex: 1;
+            padding-left: 2rem;
+            padding-right: 2rem;
+        }
+
+        .cover-title {
+            font-family: var(--font-display);
+            font-size: clamp(3rem, 8vw, 6.8rem);
+            line-height: 0.9;
+            letter-spacing: -0.04em;
+            max-width: 7ch;
+        }
+
+        .cover-note {
+            align-self: end;
+            padding: clamp(1rem, 1.5vw, 1.2rem);
+            border: 1px solid rgba(76, 59, 39, 0.14);
+            border-radius: 1.2rem;
+            background: rgba(255,255,255,0.36);
+        }
+
+        .cover-note .info-line {
+            font-size: clamp(1rem, 1.3vw, 1.2rem);
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+
+        .cover-footer {
+            display: flex;
+            justify-content: space-between;
+            padding: 0 2rem;
+            color: var(--text-muted);
+            font-size: var(--small-size);
+            letter-spacing: 0.08em;
+        }
+
+        .feature-grid-2,
+        .feature-grid-3,
+        .step-grid,
+        .showcase-grid,
+        .case-grid,
+        .closing-grid {
+            display: grid;
+            gap: clamp(0.75rem, 1.2vw, 1rem);
+            padding: 0 2rem 2rem;
+            min-height: 0;
+            flex: 1;
+        }
+
+        .feature-grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .feature-grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .step-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); grid-auto-rows: minmax(0, 1fr); }
+        .showcase-grid { grid-template-columns: 1fr 1fr; grid-template-rows: minmax(0, 1fr) auto; }
+        .case-grid { grid-template-columns: minmax(0, 1.08fr) minmax(260px, 0.92fr); }
+        .closing-grid { grid-template-columns: minmax(0, 1.15fr) minmax(280px, 0.85fr); }
+
+        .panel,
+        .metric-card,
+        .step-card,
+        .story-card,
+        .ability-card,
+        .note-card,
+        .image-card,
+        .code-card {
+            min-width: 0;
+            min-height: 0;
+            background: rgba(255,255,255,0.36);
+            border: 1px solid rgba(76, 59, 39, 0.12);
+            border-radius: 1.25rem;
+            padding: clamp(0.9rem, 1.5vw, 1.2rem);
+            display: flex;
+            flex-direction: column;
+            gap: 0.65rem;
+            overflow: hidden;
+        }
+
+        .panel strong,
+        .metric-value,
+        .step-no,
+        .story-card strong,
+        .ability-card strong {
+            color: var(--text-primary);
+        }
+
+        .metric-hero {
+            display: flex;
+            align-items: end;
+            gap: 0.8rem;
+            flex-wrap: wrap;
+        }
+
+        .metric-value {
+            font-family: var(--font-display);
+            font-size: clamp(2.8rem, 6vw, 5rem);
+            line-height: 0.88;
+        }
+
+        .metric-arrow {
+            font-size: clamp(1.8rem, 3vw, 2.7rem);
+            color: var(--accent-deep);
+            margin-bottom: 0.4rem;
+        }
+
+        .label-pill {
+            display: inline-flex;
+            align-self: start;
+            padding: 0.45rem 0.7rem;
+            border-radius: 999px;
+            background: var(--accent-soft);
+            color: var(--accent-deep);
+            font-size: var(--small-size);
+            font-weight: 700;
+            letter-spacing: 0.06em;
+        }
+
+        .body-list {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: 0.55rem;
+            color: var(--text-secondary);
+            font-size: clamp(0.88rem, 1.1vw, 1rem);
+            line-height: 1.48;
+        }
+
+        .body-list li {
+            position: relative;
+            padding-left: 1rem;
+        }
+
+        .body-list li::before {
+            content: "";
+            position: absolute;
+            left: 0;
+            top: 0.55em;
+            width: 0.45rem;
+            height: 0.45rem;
+            border-radius: 999px;
+            background: var(--accent);
+        }
+
+        .statement-card {
+            padding: clamp(1.1rem, 1.8vw, 1.4rem);
+            background: linear-gradient(180deg, rgba(255,255,255,0.44), rgba(255,255,255,0.26));
+            border: 1px solid rgba(76, 59, 39, 0.12);
+            border-radius: 1.4rem;
+            color: var(--text-primary);
+            font-size: clamp(1.3rem, 2vw, 1.85rem);
+            line-height: 1.32;
+            font-family: var(--font-cn);
+            font-weight: 700;
+        }
+
+        .step-no {
+            font-family: var(--font-display);
+            font-size: clamp(1.6rem, 2.4vw, 2.2rem);
+            line-height: 1;
+            color: var(--accent-deep);
+        }
+
+        .step-card p,
+        .story-card p,
+        .ability-card p,
+        .note-card p,
+        .panel p {
+            color: var(--text-secondary);
+            font-size: clamp(0.84rem, 1vw, 0.95rem);
+            line-height: 1.52;
+        }
+
+        .image-card img {
+            width: 100%;
+            height: 100%;
+            max-height: min(27vh, 240px);
+            object-fit: contain;
+            border-radius: 0.9rem;
+            background: #f0ece4;
+            border: 1px solid rgba(76,59,39,0.08);
+        }
+
+        .code-card pre {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: clamp(0.7rem, 0.82vw, 0.82rem);
+            line-height: 1.45;
+            white-space: pre-wrap;
+            color: #2d241b;
+            background: rgba(255,255,255,0.54);
+            border-radius: 0.95rem;
+            border: 1px solid rgba(76,59,39,0.1);
+            padding: 0.9rem;
+            overflow: hidden;
+        }
+
+        .mini-caption {
+            color: var(--text-muted);
+            font-size: var(--small-size);
+            line-height: 1.5;
+        }
+
+        .highlight-line {
+            display: flex;
+            align-items: center;
+            gap: 0.7rem;
+            padding: 0.7rem 0;
+            border-bottom: 1px solid rgba(76,59,39,0.1);
+            color: var(--text-secondary);
+            font-size: clamp(0.88rem, 1vw, 1rem);
+            line-height: 1.48;
+        }
+
+        .highlight-line:last-child {
+            border-bottom: 0;
+        }
+
+        .highlight-index {
+            flex: 0 0 auto;
+            width: 1.8rem;
+            height: 1.8rem;
+            border-radius: 999px;
+            display: inline-grid;
+            place-items: center;
+            background: var(--accent-soft);
+            color: var(--accent-deep);
+            font-size: var(--small-size);
+            font-weight: 700;
+        }
+
+        .thanks {
+            display: grid;
+            place-items: center;
+            text-align: center;
+            height: 100%;
+            gap: 1rem;
+            padding: 0 2rem;
+        }
+
+        .thanks .headline {
+            font-size: clamp(3rem, 7vw, 6rem);
+        }
+
+        .thanks p {
+            color: var(--text-secondary);
+            font-size: clamp(1rem, 1.3vw, 1.14rem);
+        }
+
+        [contenteditable="true"] {
+            outline: 2px dashed rgba(197, 106, 44, 0.35);
+            outline-offset: 4px;
+            border-radius: 0.35rem;
+        }
+
+        /* ===========================================
+           RESPONSIVE OVERRIDES
+           =========================================== */
+        @media (max-width: 960px) {
+            .cover-grid,
+            .feature-grid-2,
+            .feature-grid-3,
+            .step-grid,
+            .showcase-grid,
+            .case-grid,
+            .closing-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .showcase-grid {
+                grid-template-rows: repeat(3, minmax(0, auto));
+            }
+
+            .tabs {
+                display: none;
+            }
+
+            .binder-holes {
+                display: none;
+            }
+
+            .title-row,
+            .cover-grid,
+            .feature-grid-2,
+            .feature-grid-3,
+            .step-grid,
+            .showcase-grid,
+            .case-grid,
+            .closing-grid {
+                padding-left: 0;
+                padding-right: 0;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="progress-bar" id="progressBar"></div>
+    <nav class="nav-dots" id="navDots"></nav>
+    <div class="keyboard-hint">ARROWS / SPACE / SWIPE</div>
+    <div class="draft-badge">Draft V17</div>
+    <div class="edit-hotzone"></div>
+    <button class="edit-toggle" id="editToggle" title="Edit mode (E)">Edit</button>
+    <button class="save-button" id="saveButton" title="Save HTML (Ctrl/Cmd+S)">Export</button>
+
+    <!-- ===========================================
+         SLIDE 1: COVER
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper cover-paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">INTRO</span><span class="tab t2">RESULT</span><span class="tab t3">PLAN</span></div>
+                <div class="paper-inner">
+                    <div class="topline">
+                        <div class="section-mark reveal-left stagger-1">Promotion Defense</div>
+                        <div class="page-mark reveal stagger-2">01 / 16</div>
+                    </div>
+                    <div class="cover-grid">
+                        <div>
+                            <div class="cover-title reveal-blur stagger-2" data-editable="true" data-edit-key="cover-title">4399职级申报答辩</div>
+                        </div>
+                        <div class="cover-note reveal-scale stagger-3">
+                            <div class="info-line" data-editable="true" data-edit-key="cover-info-1">运营编辑部</div>
+                            <div class="info-line" data-editable="true" data-edit-key="cover-info-2">平台运营</div>
+                            <div class="info-line" data-editable="true" data-edit-key="cover-info-3">答辩人：王荣鑫</div>
+                            <div class="info-line" data-editable="true" data-edit-key="cover-info-4">申报职级：P3-T1</div>
+                        </div>
+                    </div>
+                    <div class="cover-footer reveal stagger-4">
+                        <span>AI Workflow / Internal Presentation</span>
+                        <span>2026</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===========================================
+         SLIDE 2: MODULE INTRO
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper module-paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">SECTION</span><span class="tab t2">WORK</span><span class="tab t3">INTRO</span></div>
+                <div class="paper-inner">
+                    <div class="section-mark reveal-left stagger-1">Section 01</div>
+                    <div class="headline reveal-blur stagger-2" data-editable="true" data-edit-key="module-intro-title">工作介绍</div>
+                    <div class="subline reveal stagger-3" data-editable="true" data-edit-key="module-intro-sub">先说明我原来在什么业务场景里工作，以及这些工作让我积累了什么经验。</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===========================================
+         SLIDE 3: WORK EXPERIENCE
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">WORK</span><span class="tab t2">ROLE</span><span class="tab t3">FIELD</span></div>
+                <div class="paper-inner">
+                    <div class="topline">
+                        <div class="section-mark reveal-left stagger-1">Work Experience</div>
+                        <div class="page-mark reveal stagger-2">03 / 16</div>
+                    </div>
+                    <div class="title-row">
+                        <div class="headline reveal-blur stagger-2" data-editable="true" data-edit-key="work-title">工作经历</div>
+                        <div class="subline reveal stagger-3" data-editable="true" data-edit-key="work-sub">我原来的工作场景主要围绕云游戏业务展开，这些经历构成了后续做 AI 工作流改造的业务基础。</div>
+                    </div>
+                    <div class="case-grid">
+                        <div class="statement-card reveal-left stagger-2" data-editable="true" data-edit-key="work-statement">这些工作让我积累了数据分析、活动策划、热点运营、功能优化和业务协同等方面的经验。</div>
+                        <div class="panel reveal-scale stagger-3">
+                            <ul class="body-list">
+                                <li data-editable="true" data-edit-key="work-1">参与游戏盒云游戏项目数据相关分析报告从 0 到 1 的搭建</li>
+                                <li data-editable="true" data-edit-key="work-2">负责云游戏相关活动策划</li>
+                                <li data-editable="true" data-edit-key="work-3">关注市场热点，维护热点游戏氛围</li>
+                                <li data-editable="true" data-edit-key="work-4">跟进测试反馈，推动功能优化</li>
+                                <li data-editable="true" data-edit-key="work-5">目前通过 AI 对原有工作流进行重构提效</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===========================================
+         SLIDE 4: MODULE ABILITY
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper module-paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">SECTION</span><span class="tab t2">ABILITY</span><span class="tab t3">TEAM</span></div>
+                <div class="paper-inner">
+                    <div class="section-mark reveal-left stagger-1">Section 02</div>
+                    <div class="headline reveal-blur stagger-2" data-editable="true" data-edit-key="module-ability-title">个人能力与团队贡献</div>
+                    <div class="subline reveal stagger-3" data-editable="true" data-edit-key="module-ability-sub">接着说明我通过这个 AI 项目形成了什么新的工作方式，以及它对团队带来了什么变化。</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===========================================
+         SLIDE 5: PERSONAL ABILITY
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">ABILITY</span><span class="tab t2">METHOD</span><span class="tab t3">JUDGMENT</span></div>
+                <div class="paper-inner">
+                    <div class="topline">
+                        <div class="section-mark reveal-left stagger-1">Personal Ability</div>
+                        <div class="page-mark reveal stagger-2">05 / 16</div>
+                    </div>
+                    <div class="title-row">
+                        <div class="headline reveal-blur stagger-2" data-editable="true" data-edit-key="ability-title">个人能力</div>
+                        <div class="subline reveal stagger-3" data-editable="true" data-edit-key="ability-sub">通过原有业务积累和 AI 项目实践，我形成了更贴近真实工作结果的新工作方式。</div>
+                    </div>
+                    <div class="feature-grid-2">
+                        <div class="ability-card reveal stagger-2">
+                            <span class="label-pill">01</span>
+                            <strong data-editable="true" data-edit-key="ability-1-title">更接近真实业务结果</strong>
+                            <p data-editable="true" data-edit-key="ability-1-body">不只是会用 AI，而是能用 AI 做出更接近真实业务场景的交付结果。</p>
+                        </div>
+                        <div class="ability-card reveal stagger-3">
+                            <span class="label-pill">02</span>
+                            <strong data-editable="true" data-edit-key="ability-2-title">适应新的协作方式</strong>
+                            <p data-editable="true" data-edit-key="ability-2-body">不只是自己会用 AI，还能在新的协作方式里高效推进工作。</p>
+                        </div>
+                        <div class="ability-card reveal stagger-4">
+                            <span class="label-pill">03</span>
+                            <strong data-editable="true" data-edit-key="ability-3-title">把判断力教给 AI</strong>
+                            <p data-editable="true" data-edit-key="ability-3-body">不只是会使用 AI，还能把自己的业务判断标准和结果要求沉淀给 AI。</p>
+                        </div>
+                        <div class="ability-card reveal stagger-5">
+                            <span class="label-pill">04</span>
+                            <strong data-editable="true" data-edit-key="ability-4-title">控制结果可用范围</strong>
+                            <p data-editable="true" data-edit-key="ability-4-body">能够通过拆解、验证和测试，把 AI 输出控制在可用、可扩展、可交付的范围内。</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===========================================
+         SLIDE 6: TEAM CONTRIBUTION
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">TEAM</span><span class="tab t2">SHARE</span><span class="tab t3">CHANGE</span></div>
+                <div class="paper-inner">
+                    <div class="topline">
+                        <div class="section-mark reveal-left stagger-1">Team Contribution</div>
+                        <div class="page-mark reveal stagger-2">06 / 16</div>
+                    </div>
+                    <div class="title-row">
+                        <div class="headline reveal-blur stagger-2" data-editable="true" data-edit-key="team-title">团队贡献</div>
+                        <div class="subline reveal stagger-3" data-editable="true" data-edit-key="team-sub">这个项目的价值不只是个人提效，也在推动组内对 AI 的理解和协作方式变化。</div>
+                    </div>
+                    <div class="closing-grid">
+                        <div class="panel reveal-left stagger-2">
+                            <div class="highlight-line"><span class="highlight-index">1</span><span data-editable="true" data-edit-key="team-1">积极探索 AI 在软件行业中的颠覆式应用，并推动业务场景落地</span></div>
+                            <div class="highlight-line"><span class="highlight-index">2</span><span data-editable="true" data-edit-key="team-2">推动组内工作流以及工作方式转变，提升整体执行效率</span></div>
+                            <div class="highlight-line"><span class="highlight-index">3</span><span data-editable="true" data-edit-key="team-3">积极教学分享 AI 相关的使用经验，帮助组内同事提升实践能力</span></div>
+                        </div>
+                        <div class="statement-card reveal-scale stagger-3" data-editable="true" data-edit-key="team-statement">我希望传递的不只是“怎么用 AI”，而是“怎么把 AI 真正带进工作流”。</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===========================================
+         SLIDE 7: MODULE RESULTS
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper module-paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">SECTION</span><span class="tab t2">RESULT</span><span class="tab t3">CASE</span></div>
+                <div class="paper-inner">
+                    <div class="section-mark reveal-left stagger-1">Section 03</div>
+                    <div class="headline reveal-blur stagger-2" data-editable="true" data-edit-key="module-results-title">工作成果</div>
+                    <div class="subline reveal stagger-3" data-editable="true" data-edit-key="module-results-sub">这一部分重点说明我做成了什么，以及我是怎样把 AI 输出逐步收束成真实可交付的业务结果。</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===========================================
+         SLIDE 8: RESULTS OVERVIEW
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">RESULT</span><span class="tab t2">OVERVIEW</span><span class="tab t3">KPI</span></div>
+                <div class="paper-inner">
+                    <div class="topline">
+                        <div class="section-mark reveal-left stagger-1">Results Overview</div>
+                        <div class="page-mark reveal stagger-2">08 / 16</div>
+                    </div>
+                    <div class="title-row">
+                        <div class="headline reveal-blur stagger-2" data-editable="true" data-edit-key="overview-title">整体成果概览</div>
+                        <div class="subline reveal stagger-3" data-editable="true" data-edit-key="overview-sub">AI 辅助能力已经从单点提效，延伸到业务交付和团队工作方式优化。</div>
+                    </div>
+                    <div class="feature-grid-3">
+                        <div class="metric-card reveal-left stagger-2">
+                            <span class="label-pill">核心项目</span>
+                            <strong data-editable="true" data-edit-key="overview-card-1-title">云游戏日报自动化工作流</strong>
+                            <p data-editable="true" data-edit-key="overview-card-1-body">把原本依赖人工串联的日报流程，做成了可运行、可复用、可交付的自动化链路。</p>
+                        </div>
+                        <div class="metric-card reveal stagger-3">
+                            <span class="label-pill">提效结果</span>
+                            <div class="metric-hero">
+                                <div class="metric-value" data-editable="true" data-edit-key="overview-metric-old">45 分钟</div>
+                                <div class="metric-arrow">→</div>
+                                <div class="metric-value" data-editable="true" data-edit-key="overview-metric-new">5 分钟</div>
+                            </div>
+                            <p data-editable="true" data-edit-key="overview-card-2-body">单次节省约 40 分钟，其余环节由自动化流程完成。</p>
+                        </div>
+                        <div class="metric-card reveal-scale stagger-4">
+                            <span class="label-pill">能力延展</span>
+                            <strong data-editable="true" data-edit-key="overview-card-3-title">补充案例持续落地</strong>
+                            <p data-editable="true" data-edit-key="overview-card-3-body">AI 执行能力不再停留于一个日报项目，而是逐步迁移到更多运营场景里。</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===========================================
+         SLIDE 9: PAIN POINT
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">PAIN</span><span class="tab t2">CONTEXT</span><span class="tab t3">ISSUE</span></div>
+                <div class="paper-inner">
+                    <div class="topline">
+                        <div class="section-mark reveal-left stagger-1">Case Background</div>
+                        <div class="page-mark reveal stagger-2">09 / 16</div>
+                    </div>
+                    <div class="title-row">
+                        <div class="headline reveal-blur stagger-2" data-editable="true" data-edit-key="pain-title">核心案例背景与痛点</div>
+                        <div class="statement-card reveal stagger-3" data-editable="true" data-edit-key="pain-statement">人工操作 + 多平台切换，导致耗时高且错误率高。</div>
+                    </div>
+                    <div class="feature-grid-2">
+                        <div class="panel reveal-left stagger-2">
+                            <strong data-editable="true" data-edit-key="pain-1-title">流程分散</strong>
+                            <p data-editable="true" data-edit-key="pain-1-body">原流程需要在多个后台之间反复切换，步骤多且分散。</p>
+                        </div>
+                        <div class="panel reveal stagger-3">
+                            <strong data-editable="true" data-edit-key="pain-2-title">人工整理成本高</strong>
+                            <p data-editable="true" data-edit-key="pain-2-body">日报生成依赖人工复制、整理、排序、截图、排版和发送。</p>
+                        </div>
+                        <div class="panel reveal stagger-4">
+                            <strong data-editable="true" data-edit-key="pain-3-title">结果容易出错</strong>
+                            <p data-editable="true" data-edit-key="pain-3-body">登录态、字段遗漏、格式不统一等问题，会直接影响最终交付质量。</p>
+                        </div>
+                        <div class="panel reveal-scale stagger-5">
+                            <strong data-editable="true" data-edit-key="pain-4-title">旧流程耗时长</strong>
+                            <p data-editable="true" data-edit-key="pain-4-body">旧版流程单次约需 45 分钟，重复投入高。</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===========================================
+         SLIDE 10: METHOD
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">METHOD</span><span class="tab t2">MVP</span><span class="tab t3">TEST</span></div>
+                <div class="paper-inner">
+                    <div class="topline">
+                        <div class="section-mark reveal-left stagger-1">Method</div>
+                        <div class="page-mark reveal stagger-2">10 / 16</div>
+                    </div>
+                    <div class="title-row">
+                        <div class="headline reveal-blur stagger-2" data-editable="true" data-edit-key="method-title">核心案例推进方法</div>
+                        <div class="subline reveal stagger-3" data-editable="true" data-edit-key="method-sub">在了解大模型边界的前提下，通过拆解、验证和约束，把 AI 输出逐步控制成可交付结果。</div>
+                    </div>
+                    <div class="step-grid">
+                        <div class="step-card reveal-left stagger-2"><div class="step-no">01</div><strong data-editable="true" data-edit-key="method-1-title">提出整体需求</strong><p data-editable="true" data-edit-key="method-1-body">先发现问题，提出整体需求，明确最终要解决的业务目标。</p></div>
+                        <div class="step-card reveal stagger-2"><div class="step-no">02</div><strong data-editable="true" data-edit-key="method-2-title">拆到 MVP</strong><p data-editable="true" data-edit-key="method-2-body">持续拆解需求，直到拆出最小可行性产品（MVP）。</p></div>
+                        <div class="step-card reveal stagger-3"><div class="step-no">03</div><strong data-editable="true" data-edit-key="method-3-title">定义成功标准</strong><p data-editable="true" data-edit-key="method-3-body">提前确认 MVP 测试成功标准，而不是开发完成后再判断效果。</p></div>
+                        <div class="step-card reveal stagger-3"><div class="step-no">04</div><strong data-editable="true" data-edit-key="method-4-title">构建测试用例</strong><p data-editable="true" data-edit-key="method-4-body">围绕成功标准构建测试用例，让 AI 基于可验证目标推进开发。</p></div>
+                        <div class="step-card reveal stagger-4"><div class="step-no">05</div><strong data-editable="true" data-edit-key="method-5-title">按 SOLID 扩展</strong><p data-editable="true" data-edit-key="method-5-body">在 MVP 验证通过后，再按 SOLID 原则拆分和开发扩展组件，并接回主流程。</p></div>
+                        <div class="step-card reveal-scale stagger-5"><div class="step-no">06</div><strong data-editable="true" data-edit-key="method-6-title">整体联调测试</strong><p data-editable="true" data-edit-key="method-6-body">最后进行整体联调和全链路测试，确保结果可运行、可扩展、可交付。</p></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===========================================
+         SLIDE 11: CASE RESULT
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">RESULT</span><span class="tab t2">FLOW</span><span class="tab t3">DELIVER</span></div>
+                <div class="paper-inner">
+                    <div class="topline">
+                        <div class="section-mark reveal-left stagger-1">Case Result</div>
+                        <div class="page-mark reveal stagger-2">11 / 16</div>
+                    </div>
+                    <div class="title-row">
+                        <div class="headline reveal-blur stagger-2" data-editable="true" data-edit-key="case-result-title">核心案例成果</div>
+                        <div class="subline reveal stagger-3" data-editable="true" data-edit-key="case-result-sub">从抓取、处理、生成到推送，形成了稳定可运行的自动化交付流程。</div>
+                    </div>
+                    <div class="closing-grid">
+                        <div class="panel reveal-left stagger-2">
+                            <div class="highlight-line"><span class="highlight-index">A</span><span data-editable="true" data-edit-key="case-result-1">自动抓取：自动拉取 870、505、PC 后台等多源数据</span></div>
+                            <div class="highlight-line"><span class="highlight-index">B</span><span data-editable="true" data-edit-key="case-result-2">自动生成：自动清洗数据、生成日报文本和图表内容</span></div>
+                            <div class="highlight-line"><span class="highlight-index">C</span><span data-editable="true" data-edit-key="case-result-3">自动推送：自动创建飞书文档并推送群内链接，形成真实交付</span></div>
+                        </div>
+                        <div class="metric-card reveal-scale stagger-3">
+                            <span class="label-pill">效率结果</span>
+                            <div class="metric-hero">
+                                <div class="metric-value" data-editable="true" data-edit-key="case-result-old">45 分钟</div>
+                                <div class="metric-arrow">→</div>
+                                <div class="metric-value" data-editable="true" data-edit-key="case-result-new">5 分钟</div>
+                            </div>
+                            <p data-editable="true" data-edit-key="case-result-summary">新流程只需完成登录准备，其余步骤由系统自动执行，单次节省约 40 分钟。</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===========================================
+         SLIDE 12: SHOWCASE
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">PROOF</span><span class="tab t2">GUI</span><span class="tab t3">TEMPLATE</span></div>
+                <div class="paper-inner">
+                    <div class="topline">
+                        <div class="section-mark reveal-left stagger-1">Showcase</div>
+                        <div class="page-mark reveal stagger-2">12 / 16</div>
+                    </div>
+                    <div class="title-row">
+                        <div class="headline reveal-blur stagger-2" data-editable="true" data-edit-key="showcase-title">核心案例补充展示</div>
+                        <div class="subline reveal stagger-3" data-editable="true" data-edit-key="showcase-sub">这页只作为证明材料：结果可直接消费，工具可直接使用，输出格式可稳定复用。</div>
+                    </div>
+                    <div class="showcase-grid">
+                        <div class="image-card reveal-left stagger-2">
+                            <span class="label-pill">最终交付结果形态</span>
+                            <img src="final-delivery-result.png" alt="最终交付结果截图">
+                        </div>
+                        <div class="image-card reveal stagger-3">
+                            <span class="label-pill">GUI 页面展示</span>
+                            <img src="gui-screenshot-2026-03-17-001159.png" alt="GUI 页面截图">
+                        </div>
+                        <div class="code-card reveal-scale stagger-4" style="grid-column: 1 / -1;">
+                            <span class="label-pill">文本模板代码</span>
+                            <pre data-editable="true" data-edit-key="template-code">{{ report_date_cn }}游戏盒PC云游戏数据
+一、游戏盒PC云游戏相关数据日报
+PC云游戏总并发峰值：{{ target.concurrency.formatted_peak_value }}
+PC云游戏总排队峰值：{{ target.queue.formatted_peak_value }}
+{{ target.queue_summary }}
+[pc云游戏图片]
+
+二、云游戏活跃用户top(去重)
+| 游戏 | 活跃用户数 |
+| :---: | :---: |</pre>
+                            <div class="mini-caption" data-editable="true" data-edit-key="template-caption">固定模板 + 变量占位的方式，可以把文案格式和业务字段绑定起来，保证每天输出结构一致。</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===========================================
+         SLIDE 13: SUPPLEMENTARY CASE
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">CASE</span><span class="tab t2">EXTEND</span><span class="tab t3">TRANSFER</span></div>
+                <div class="paper-inner">
+                    <div class="topline">
+                        <div class="section-mark reveal-left stagger-1">Supplementary Case</div>
+                        <div class="page-mark reveal stagger-2">13 / 16</div>
+                    </div>
+                    <div class="title-row">
+                        <div class="headline reveal-blur stagger-2" data-editable="true" data-edit-key="extra-title">补充案例：后台资源位批量配置</div>
+                        <div class="subline reveal stagger-3" data-editable="true" data-edit-key="extra-sub">AI 执行能力并非只应用在一个项目中，而是已具备迁移到其他运营场景的能力。</div>
+                    </div>
+                    <div class="feature-grid-2">
+                        <div class="story-card reveal-left stagger-2">
+                            <span class="label-pill">背景</span>
+                            <p data-editable="true" data-edit-key="extra-1">原需求被排期搁置两年，长期依赖人工重复操作。</p>
+                        </div>
+                        <div class="story-card reveal stagger-3">
+                            <span class="label-pill">动作</span>
+                            <p data-editable="true" data-edit-key="extra-2">借助 AI 提供方案选择、生成代码并持续修正报错。</p>
+                        </div>
+                        <div class="story-card reveal stagger-4">
+                            <span class="label-pill">结果</span>
+                            <p data-editable="true" data-edit-key="extra-3">最终完成抓包、接口解析和自动化配置脚本生成。</p>
+                        </div>
+                        <div class="story-card reveal-scale stagger-5">
+                            <span class="label-pill">价值</span>
+                            <p data-editable="true" data-edit-key="extra-4">原本需要手动重复点击的工作，在一下午内跑通并完成验证。</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===========================================
+         SLIDE 14: MODULE PLAN
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper module-paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">SECTION</span><span class="tab t2">PLAN</span><span class="tab t3">NEXT</span></div>
+                <div class="paper-inner">
+                    <div class="section-mark reveal-left stagger-1">Section 04</div>
+                    <div class="headline reveal-blur stagger-2" data-editable="true" data-edit-key="module-plan-title">规划展望</div>
+                    <div class="subline reveal stagger-3" data-editable="true" data-edit-key="module-plan-sub">最后回到原来的业务场景，说明如果现在再做这些事，我会怎样用新的方法把它们做得更好。</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===========================================
+         SLIDE 15: PLAN CONTENT
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">PLAN</span><span class="tab t2">NEXT</span><span class="tab t3">FUTURE</span></div>
+                <div class="paper-inner">
+                    <div class="topline">
+                        <div class="section-mark reveal-left stagger-1">Future Plan</div>
+                        <div class="page-mark reveal stagger-2">15 / 16</div>
+                    </div>
+                    <div class="title-row">
+                        <div class="headline reveal-blur stagger-2" data-editable="true" data-edit-key="plan-title">规划展望内容</div>
+                    </div>
+                    <div class="closing-grid">
+                        <div class="statement-card reveal-left stagger-2" data-editable="true" data-edit-key="plan-statement">如果再回到原来的业务场景，我会优先思考如何把工作做成可复用、可验证、可持续优化的流程。</div>
+                        <div class="panel reveal-scale stagger-3">
+                            <ul class="body-list">
+                                <li data-editable="true" data-edit-key="plan-1">继续围绕高频重复场景，寻找可自动化的运营链路</li>
+                                <li data-editable="true" data-edit-key="plan-2">把已有项目经验沉淀成可复用的方法和规范</li>
+                                <li data-editable="true" data-edit-key="plan-3">在新的协作方式中，进一步提升人与 AI 协同工作的效率</li>
+                                <li data-editable="true" data-edit-key="plan-4">持续沉淀业务判断标准，让 AI 更稳定地服务于实际工作结果</li>
+                                <li data-editable="true" data-edit-key="plan-5">从个人提效走向团队提效，提升整体协同效率和交付质量</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===========================================
+         SLIDE 16: THANKS
+         =========================================== -->
+    <section class="slide">
+        <div class="slide-content">
+            <div class="paper">
+                <div class="binder-holes"><span></span><span></span><span></span><span></span><span></span></div>
+                <div class="tabs"><span class="tab t1">END</span><span class="tab t2">THANKS</span><span class="tab t3">CLOSE</span></div>
+                <div class="paper-inner">
+                    <div class="thanks">
+                        <div class="section-mark reveal-left stagger-1">Closing</div>
+                        <div class="headline reveal-blur stagger-2" data-editable="true" data-edit-key="thanks-title">感谢聆听</div>
+                        <p class="reveal stagger-3" data-editable="true" data-edit-key="thanks-sub">答辩人：王荣鑫</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <script>
+        /* ===========================================
+           SLIDE PRESENTATION CONTROLLER
+           =========================================== */
+        class SlidePresentation {
+            constructor() {
+                this.slides = Array.from(document.querySelectorAll('.slide'));
+                this.progressBar = document.getElementById('progressBar');
+                this.navDots = document.getElementById('navDots');
+                this.currentSlide = 0;
+                this.touchStartY = 0;
+                this.touchEndY = 0;
+                this.isScrolling = false;
+                this.setupObserver();
+                this.setupNavDots();
+                this.setupKeyboardNav();
+                this.setupWheelNav();
+                this.setupTouchNav();
+                this.updateProgress();
+            }
+
+            setupObserver() {
+                const observer = new IntersectionObserver((entries) => {
+                    entries.forEach((entry) => {
+                        if (entry.isIntersecting) {
+                            entry.target.classList.add('visible');
+                            this.currentSlide = this.slides.indexOf(entry.target);
+                            this.updateProgress();
+                            this.updateNavDots();
+                        }
+                    });
+                }, { threshold: 0.55 });
+
+                this.slides.forEach((slide) => observer.observe(slide));
+            }
+
+            setupNavDots() {
+                this.slides.forEach((_, index) => {
+                    const dot = document.createElement('button');
+                    dot.className = 'nav-dot';
+                    dot.addEventListener('click', () => this.goToSlide(index));
+                    this.navDots.appendChild(dot);
+                });
+                this.updateNavDots();
+            }
+
+            updateNavDots() {
+                Array.from(this.navDots.children).forEach((dot, index) => {
+                    dot.classList.toggle('active', index === this.currentSlide);
+                });
+            }
+
+            updateProgress() {
+                const progress = ((this.currentSlide + 1) / this.slides.length) * 100;
+                this.progressBar.style.width = `${progress}%`;
+            }
+
+            goToSlide(index) {
+                const target = this.slides[index];
+                if (target) {
+                    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+            }
+
+            goNext() {
+                this.goToSlide(Math.min(this.currentSlide + 1, this.slides.length - 1));
+            }
+
+            goPrev() {
+                this.goToSlide(Math.max(this.currentSlide - 1, 0));
+            }
+
+            setupKeyboardNav() {
+                document.addEventListener('keydown', (e) => {
+                    const editable = e.target && e.target.getAttribute && e.target.getAttribute('contenteditable') === 'true';
+                    if (editable) return;
+                    if (['ArrowDown', 'PageDown', ' '].includes(e.key)) {
+                        e.preventDefault();
+                        this.goNext();
+                    }
+                    if (['ArrowUp', 'PageUp'].includes(e.key)) {
+                        e.preventDefault();
+                        this.goPrev();
+                    }
+                });
+            }
+
+            setupWheelNav() {
+                window.addEventListener('wheel', (e) => {
+                    if (this.isScrolling) return;
+                    if (Math.abs(e.deltaY) < 18) return;
+                    this.isScrolling = true;
+                    if (e.deltaY > 0) this.goNext();
+                    else this.goPrev();
+                    setTimeout(() => { this.isScrolling = false; }, 700);
+                }, { passive: true });
+            }
+
+            setupTouchNav() {
+                window.addEventListener('touchstart', (e) => {
+                    this.touchStartY = e.changedTouches[0].screenY;
+                }, { passive: true });
+                window.addEventListener('touchend', (e) => {
+                    this.touchEndY = e.changedTouches[0].screenY;
+                    const delta = this.touchStartY - this.touchEndY;
+                    if (Math.abs(delta) < 50) return;
+                    if (delta > 0) this.goNext();
+                    else this.goPrev();
+                }, { passive: true });
+            }
+        }
+
+        /* ===========================================
+           INLINE EDITOR
+           =========================================== */
+        class InlineEditor {
+            constructor() {
+                this.storageKey = 'ai-workflow-defense-v17';
+                this.isActive = false;
+                this.editToggle = document.getElementById('editToggle');
+                this.saveButton = document.getElementById('saveButton');
+                this.hotzone = document.querySelector('.edit-hotzone');
+                this.editables = Array.from(document.querySelectorAll('[data-editable="true"]'));
+                this.hideTimeout = null;
+                this.loadSaved();
+                this.setupHover();
+                this.setupButtons();
+                this.setupShortcut();
+            }
+
+            setupHover() {
+                const showControls = () => {
+                    clearTimeout(this.hideTimeout);
+                    this.editToggle.classList.add('show');
+                    this.saveButton.classList.add('show');
+                };
+                const hideControls = () => {
+                    this.hideTimeout = setTimeout(() => {
+                        if (!this.isActive) {
+                            this.editToggle.classList.remove('show');
+                            this.saveButton.classList.remove('show');
+                        }
+                    }, 400);
+                };
+                this.hotzone.addEventListener('mouseenter', showControls);
+                this.hotzone.addEventListener('mouseleave', hideControls);
+                this.editToggle.addEventListener('mouseenter', showControls);
+                this.editToggle.addEventListener('mouseleave', hideControls);
+                this.saveButton.addEventListener('mouseenter', showControls);
+                this.saveButton.addEventListener('mouseleave', hideControls);
+                this.hotzone.addEventListener('click', () => this.toggleEditMode());
+            }
+
+            setupButtons() {
+                this.editToggle.addEventListener('click', () => this.toggleEditMode());
+                this.saveButton.addEventListener('click', () => this.exportHtml());
+                document.addEventListener('keydown', (e) => {
+                    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
+                        e.preventDefault();
+                        this.exportHtml();
+                    }
+                });
+            }
+
+            setupShortcut() {
+                document.addEventListener('keydown', (e) => {
+                    const editable = e.target && e.target.getAttribute && e.target.getAttribute('contenteditable') === 'true';
+                    if ((e.key === 'e' || e.key === 'E') && !editable) {
+                        e.preventDefault();
+                        this.toggleEditMode();
+                    }
+                });
+            }
+
+            toggleEditMode() {
+                this.isActive = !this.isActive;
+                this.editToggle.classList.toggle('active', this.isActive);
+                this.saveButton.classList.toggle('active', this.isActive);
+                this.editables.forEach((el) => {
+                    el.setAttribute('contenteditable', this.isActive ? 'true' : 'false');
+                });
+                if (this.isActive) {
+                    this.editToggle.textContent = 'Done';
+                } else {
+                    this.editToggle.textContent = 'Edit';
+                    this.saveContent();
+                }
+            }
+
+            saveContent() {
+                const payload = {};
+                this.editables.forEach((el) => {
+                    payload[el.dataset.editKey] = el.innerHTML;
+                });
+                localStorage.setItem(this.storageKey, JSON.stringify(payload));
+            }
+
+            loadSaved() {
+                const raw = localStorage.getItem(this.storageKey);
+                if (!raw) return;
+                try {
+                    const data = JSON.parse(raw);
+                    this.editables.forEach((el) => {
+                        const value = data[el.dataset.editKey];
+                        if (typeof value === 'string') el.innerHTML = value;
+                    });
+                } catch (err) {
+                    console.warn('Failed to load saved edits', err);
+                }
+            }
+
+            exportHtml() {
+                this.saveContent();
+                const clone = document.documentElement.cloneNode(true);
+                clone.querySelectorAll('[contenteditable]').forEach((node) => node.removeAttribute('contenteditable'));
+                const serializer = '<!DOCTYPE html>\n' + clone.outerHTML;
+                const blob = new Blob([serializer], { type: 'text/html;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'ai-workflow-defense-v17.html';
+                a.click();
+                URL.revokeObjectURL(url);
+            }
+        }
+
+        window.addEventListener('DOMContentLoaded', () => {
+            new SlidePresentation();
+            new InlineEditor();
+        });
+    </script>
+</body>
+</html>

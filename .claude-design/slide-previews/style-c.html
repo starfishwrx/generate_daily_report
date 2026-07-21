@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Style C - Dark Botanical</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500&family=Noto+Serif+SC:wght@500;600&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; background: #0d0d0d; }
+    body { display: grid; place-items: center; font-family: "IBM Plex Sans", sans-serif; }
+    .slide {
+      width: min(92vw, 1320px);
+      height: min(88vh, 820px);
+      position: relative;
+      overflow: hidden;
+      border-radius: 2rem;
+      background: radial-gradient(circle at 82% 22%, rgba(212,165,116,.15), transparent 24%),
+                  radial-gradient(circle at 18% 78%, rgba(232,180,184,.14), transparent 28%),
+                  linear-gradient(180deg, #111 0%, #151313 100%);
+      border: 1px solid rgba(255,255,255,.08);
+      box-shadow: 0 32px 96px rgba(0,0,0,.45);
+      padding: clamp(2.2rem, 4vw, 4rem);
+    }
+    .line {
+      position: absolute;
+      top: clamp(2rem, 3vw, 2.8rem);
+      left: clamp(2rem, 4vw, 3rem);
+      width: 1px;
+      height: 24%;
+      background: linear-gradient(180deg, rgba(212,165,116,.9), rgba(212,165,116,0));
+    }
+    .eyebrow {
+      margin-left: clamp(1.6rem, 3vw, 2.6rem);
+      color: #d4a574;
+      font-size: clamp(.7rem, 1vw, .9rem);
+      letter-spacing: .34em;
+      text-transform: uppercase;
+    }
+    h1 {
+      margin-top: clamp(3rem, 7vw, 5rem);
+      max-width: 8.5ch;
+      color: #ece4da;
+      font-family: "Cormorant Garamond", "Noto Serif SC", serif;
+      font-size: clamp(3rem, 6.5vw, 6.5rem);
+      line-height: .94;
+      font-weight: 600;
+    }
+    p {
+      margin-top: 1.5rem;
+      max-width: 32rem;
+      color: #a9a09a;
+      font-size: clamp(1rem, 1.45vw, 1.18rem);
+      line-height: 1.65;
+    }
+    .footer {
+      position: absolute;
+      left: clamp(2.2rem, 4vw, 4rem);
+      right: clamp(2.2rem, 4vw, 4rem);
+      bottom: clamp(2rem, 3.5vw, 3rem);
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      color: #8f8580;
+      font-size: clamp(.88rem, 1vw, .98rem);
+    }
+  </style>
+</head>
+<body>
+  <section class="slide">
+    <div class="line"></div>
+    <div class="eyebrow">Style C / Dark Botanical</div>
+    <h1>把答辩做得更沉稳，也更像一份成熟的内部材料。</h1>
+    <p>这一版偏高级、安静、耐看，适合强调判断力、积累和成长，而不是单纯强调技术感。</p>
+    <div class="footer">
+      <span>Promotion Defense / 2026</span>
+      <span>Elegant / Warm Dark</span>
+    </div>
+  </section>
+</body>
+</html>
