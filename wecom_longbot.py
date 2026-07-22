@@ -259,12 +259,11 @@ class WeComLongBotClient:
                 return frame
 
 
-def publish_reports_to_wecom(
+def _prepare_wecom_messages(
     *,
     settings: WeComBotSettings,
-    chatid: str,
     reports: Sequence[Dict[str, str]],
-) -> Dict[str, Any]:
+) -> tuple[List[Dict[str, Any]], List[str]]:
     all_bodies: List[Dict[str, Any]] = []
     report_titles: List[str] = []
     for report in reports:
@@ -292,8 +291,18 @@ def publish_reports_to_wecom(
             all_bodies.append(build_wecom_image_body(path))
     if not all_bodies:
         raise WeComBotError("没有可推送到企业微信的日报内容")
+    return all_bodies, report_titles
+
+
+async def publish_reports_to_wecom_async(
+    *,
+    settings: WeComBotSettings,
+    chatid: str,
+    reports: Sequence[Dict[str, str]],
+) -> Dict[str, Any]:
+    all_bodies, report_titles = _prepare_wecom_messages(settings=settings, reports=reports)
     try:
-        responses = asyncio.run(WeComLongBotClient(settings).send_messages(chatid=chatid, bodies=all_bodies))
+        responses = await WeComLongBotClient(settings).send_messages(chatid=chatid, bodies=all_bodies)
     except WeComBotError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -305,3 +314,14 @@ def publish_reports_to_wecom(
         "message_count": len(all_bodies),
         "responses": responses,
     }
+
+
+def publish_reports_to_wecom(
+    *,
+    settings: WeComBotSettings,
+    chatid: str,
+    reports: Sequence[Dict[str, str]],
+) -> Dict[str, Any]:
+    """Synchronous compatibility wrapper for CLI paths outside an event loop."""
+
+    return asyncio.run(publish_reports_to_wecom_async(settings=settings, chatid=chatid, reports=reports))

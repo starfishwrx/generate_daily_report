@@ -73,6 +73,28 @@ def test_uncertain_publish_blocks_until_user_resolution(tmp_path: Path) -> None:
     assert store.entry("feishu_main", "h").status is PublishStatus.FAILED
 
 
+def test_known_nested_loop_wecom_failure_is_safely_recovered(tmp_path: Path) -> None:
+    store = PublishStateStore(tmp_path, date(2026, 7, 22))
+    store.mark_uncertain(
+        "wecom_single",
+        "same-content",
+        error="企业微信推送异常：RuntimeError: asyncio.run() cannot be called from a running event loop",
+    )
+
+    assert store.recover_known_local_failure("wecom_single", "same-content") is True
+    assert store.entry("wecom_single", "same-content").status is PublishStatus.FAILED
+    store.assert_publish_allowed("wecom_single", "same-content")
+
+
+def test_other_uncertain_wecom_failure_remains_blocked(tmp_path: Path) -> None:
+    store = PublishStateStore(tmp_path, date(2026, 7, 22))
+    store.mark_uncertain("wecom_single", "same-content", error="connection dropped after send")
+
+    assert store.recover_known_local_failure("wecom_single", "same-content") is False
+    with pytest.raises(UncertainPublishError):
+        store.assert_publish_allowed("wecom_single", "same-content")
+
+
 def test_parallel_publish_targets_do_not_overwrite_each_other(tmp_path: Path) -> None:
     store = PublishStateStore(tmp_path, date(2026, 7, 20))
     targets = [f"target_{index}" for index in range(20)]

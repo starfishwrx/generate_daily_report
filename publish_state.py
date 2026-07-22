@@ -14,6 +14,7 @@ from autodatareport.models import PublishResolution
 
 
 PUBLISH_STATE_SCHEMA = "autodatareport.publish-state.v2"
+KNOWN_LOCAL_ONLY_WECOM_ERROR = "asyncio.run() cannot be called from a running event loop"
 
 
 class PublishStatus(str, Enum):
@@ -116,6 +117,21 @@ class PublishStateStore:
             entry = self.entry(target, payload_hash)
         if entry is not None and entry.status is PublishStatus.UNCERTAIN and not force:
             raise UncertainPublishError(target, entry)
+
+    def recover_known_local_failure(self, target: str, payload_hash: str) -> bool:
+        """Make the V1.5 nested-event-loop failure retryable because no remote coroutine ever ran."""
+
+        entry = self.entry(target, payload_hash)
+        if (
+            entry is None
+            or entry.status is not PublishStatus.UNCERTAIN
+            or not target.startswith("wecom_")
+            or bool(entry.result)
+            or KNOWN_LOCAL_ONLY_WECOM_ERROR not in entry.error
+        ):
+            return False
+        self.mark_failed(target, payload_hash, "已自动恢复 V1.5 本地事件循环错误；远端发送未开始，允许安全重试")
+        return True
 
     def mark_publishing(self, target: str, payload_hash: str, result: dict[str, Any] | None = None) -> None:
         self._update(target, PublishStatus.PUBLISHING, payload_hash, result=result)

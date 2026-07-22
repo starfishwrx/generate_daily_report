@@ -42,7 +42,12 @@ from pc_web_metrics_service import PCWebMetricsService, PCWebSettings
 from publish_state import PublishStateStore, PublishStatus, UncertainPublishError, content_hash
 from run_lock import AlreadyRunningError, single_instance_lock
 from tz_compat import get_tzinfo
-from wecom_longbot import WeComBotError, WeComBotSettings, publish_reports_to_wecom
+from wecom_longbot import (
+    WeComBotError,
+    WeComBotSettings,
+    publish_reports_to_wecom,
+    publish_reports_to_wecom_async,
+)
 from async_utils import request_budget
 from autodatareport import __version__
 from autodatareport.atomic_io import atomic_write_json, atomic_write_text, atomic_write_yaml
@@ -1782,6 +1787,24 @@ def push_reports_to_wecom_target(
         raise ReportError("没有可推送到企业微信的飞书链接。")
     return publish_reports_to_wecom(settings=settings, chatid=chatid, reports=payloads)
 
+
+async def push_reports_to_wecom_target_async(
+    *,
+    config: Dict[str, Any],
+    target: str,
+    report_date: date,
+    main_url: str = "",
+    pc_url: str = "",
+) -> Dict[str, Any]:
+    settings = resolve_wecom_bot_settings(config)
+    chatid = resolve_wecom_chatid(config, target)
+    if not chatid:
+        raise ReportError(f"企业微信 {target} 目标未配置 chatid/userid。")
+    payloads = build_wecom_link_payload(report_date, main_url=main_url, pc_url=pc_url)
+    if not payloads:
+        raise ReportError("没有可推送到企业微信的飞书链接。")
+    return await publish_reports_to_wecom_async(settings=settings, chatid=chatid, reports=payloads)
+
 def configure_matplotlib_fonts() -> None:
     global _FONT_CONFIGURED  # pylint: disable=global-statement
     if _FONT_CONFIGURED:
@@ -3334,7 +3357,7 @@ def publish_feishu_jobs(
     return batch
 
 
-def publish_daily_report_artifacts(
+async def publish_daily_report_artifacts(
     context: RunContext,
     args: argparse.Namespace,
     config: Dict[str, Any],
@@ -3444,11 +3467,18 @@ def publish_daily_report_artifacts(
             emit_progress(98, f"推送企业微信({target})")
             state_key = f"wecom_{target}"
             payload_hash = content_hash([context.report_date.isoformat(), target, urls["main"], urls["pc"]])
+            if publish_store.recover_known_local_failure(state_key, payload_hash):
+                emit_event(
+                    "publish_recovered",
+                    f"publish_{state_key}",
+                    "已恢复旧版企微本地错误，本次允许安全重试",
+                    details={"target": target},
+                )
             if coordinator.completed_result(state_key, payload_hash) is not None:
                 continue
             try:
                 coordinator.started(state_key, payload_hash)
-                result = push_reports_to_wecom_target(
+                result = await push_reports_to_wecom_target_async(
                     config=config,
                     target=target,
                     report_date=context.report_date,
@@ -3495,7 +3525,7 @@ async def execute_daily_pipeline(
         return render_daily_report_artifacts(ctx, args, date_cn, ordered_section_keys, ctx.shared["calculate"])
 
     async def publish(ctx: RunContext) -> Any:
-        return publish_daily_report_artifacts(ctx, args, config, ctx.shared["render"])
+        return await publish_daily_report_artifacts(ctx, args, config, ctx.shared["render"])
 
     return await RunPipeline(PipelineStages(authenticate, collect, calculate, render, publish)).run(context)
 
